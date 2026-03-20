@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 SKIP_AUTH_PATHS = {
     "/health", "/ready", "/docs", "/redoc", "/openapi.json",
     "/api/v1/admin/tenants",
+    "/api/v1/init/agent",
+    "/dashboard",
+    "/dashboard/home",
 }
 
 INTERNAL_TENANT_HEADER = "X-Helix-Tenant-ID"
