@@ -42,6 +42,8 @@ from routers.ops import router as ops_router
 from routers.action import router as action_router
 from routers.nodes import router as nodes_router
 from services.exchange import ensure_tables as ensure_exchange_tables
+from routers.tenants import tenants_router
+from services.tenant_auth import TenantMiddleware
 from mcp_tools import mcp as helix_mcp
 from mcp_tools_action import _register_action_tools
 from mcp_mount import setup_mcp, teardown_mcp, mcp_asgi_app
@@ -218,6 +220,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(TenantMiddleware)
 
 
 @app.get("/health")
@@ -363,6 +366,7 @@ app.include_router(membrain_vector_router, tags=["MemBrain Vector"])
 app.include_router(shard_router, tags=["Shard - Diff Context"])
 app.include_router(turn_flush_router, tags=["Turn Flush - Phase 1.3"])
 app.include_router(proxy_router, tags=["Double Helix - Phase 7a: Conversation RAG"])
+app.include_router(tenants_router, tags=["Tenants - Layer 0"])
 
 # ================================================================
 # MCP TOOLS — file ops registered here
