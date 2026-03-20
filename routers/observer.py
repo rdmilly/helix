@@ -23,7 +23,7 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Request
 from pydantic import BaseModel, Field
 
 from services.database import get_db
@@ -685,9 +685,10 @@ async def get_session_tokens(session_id: str):
         }
 
 @router.post("/tokens")
-async def record_tokens(session_id: str, exchange_num: int = 0,
+async def record_tokens(request: Request, session_id: str, exchange_num: int = 0,
                         tokens_in: int = 0, tokens_out: int = 0, tool_calls: int = 0):
     """Record token usage for a session exchange."""
+    tenant_id = getattr(request.state, 'tenant_id', 'system')
     db = get_db()
     with db.get_connection() as conn:
         prev = conn.execute(
@@ -697,9 +698,9 @@ async def record_tokens(session_id: str, exchange_num: int = 0,
         cum_in = (prev[0] if prev else 0) + tokens_in
         cum_out = (prev[1] if prev else 0) + tokens_out
         conn.execute(
-            "INSERT INTO observer_session_tokens (session_id, exchange_num, tokens_in, tokens_out, tool_calls, cumulative_in, cumulative_out, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            "INSERT INTO observer_session_tokens (session_id, exchange_num, tokens_in, tokens_out, tool_calls, cumulative_in, cumulative_out, timestamp, tenant_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
             (session_id, exchange_num, tokens_in, tokens_out, tool_calls, cum_in, cum_out,
-             datetime.now(timezone.utc).isoformat())
+             datetime.now(timezone.utc).isoformat(), tenant_id)
         )
         conn.commit()
     return {"status": "recorded", "cumulative_in": cum_in, "cumulative_out": cum_out}

@@ -44,6 +44,7 @@ from routers.nodes import router as nodes_router
 from services.exchange import ensure_tables as ensure_exchange_tables
 from routers.tenants import tenants_router
 from routers.init import init_router
+from routers.usage import usage_router
 from services.tenant_auth import TenantMiddleware
 from mcp_tools import mcp as helix_mcp
 from mcp_tools_action import _register_action_tools
@@ -369,6 +370,7 @@ app.include_router(turn_flush_router, tags=["Turn Flush - Phase 1.3"])
 app.include_router(proxy_router, tags=["Double Helix - Phase 7a: Conversation RAG"])
 app.include_router(tenants_router, tags=["Tenants - Layer 0"])
 app.include_router(init_router, tags=["Init - Layer 1"])
+app.include_router(usage_router, tags=["Usage - Layer 2"])
 
 # ================================================================
 # MCP TOOLS — file ops registered here
