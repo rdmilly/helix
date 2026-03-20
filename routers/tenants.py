@@ -58,8 +58,14 @@ def create_tenant(body: TenantCreate):
         raise HTTPException(500, str(e))
 
     logger.info(f"tenant created: {slug} ({tenant_id})")
-    return {"id": tenant_id, "slug": row[1], "name": row[2],
-            "plan": row[3], "status": row[4], "api_key": raw_key}
+    base = f"https://{slug}.helix.millyweb.com"
+    return {
+        "id": tenant_id, "slug": row[1], "name": row[2],
+        "plan": row[3], "status": row[4], "api_key": raw_key,
+        "helix_url": base,
+        "dashboard_url": f"{base}/dashboard",
+        "setup_url": f"{base}/dashboard/home?key={raw_key}",
+    }
 
 
 @tenants_router.get("/tenants")
