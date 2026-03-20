@@ -1,0 +1,260 @@
+"""Knowledge Graph Router — Entity & Relationship Management
+
+Provides CRUD for entities, relationships, and mention tracking.
+Migrated from Memory v0.5.1 with Helix-native storage.
+
+Endpoints:
+  POST   /api/v1/knowledge/entity          - Upsert entity
+  GET    /api/v1/knowledge/entity/{name}    - Get entity
+  DELETE /api/v1/knowledge/entity/{name}    - Delete entity
+  GET    /api/v1/knowledge/search           - Search entities (FTS5)
+  GET    /api/v1/knowledge/graph/{name}     - Entity + relationships
+  POST   /api/v1/knowledge/relationship     - Add relationship
+  POST   /api/v1/knowledge/mention          - Record a mention
+  GET    /api/v1/knowledge/stats            - Statistics
+  POST   /api/v1/knowledge/migrate          - Bulk import from Memory
+"""
+import json
+import sqlite3
+from services import pg_sync
+import hashlib
+import logging
+from datetime import datetime, timezone
+from typing import Optional, List, Dict, Any
+
+from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
+from pydantic import BaseModel, Field
+
+from services.database import get_db_path
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/v1/knowledge")
+
+
+def _get_conn():
+    conn = pg_sync.sqlite_conn(str(get_db_path()), timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+def _init_kg_tables():
+    conn = _get_conn()
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS kg_relationships (id INTEGER PRIMARY KEY AUTOINCREMENT, source_name TEXT NOT NULL, target_name TEXT NOT NULL, relation_type TEXT NOT NULL, description TEXT DEFAULT '', created_at TEXT DEFAULT (datetime('now')), session_id TEXT DEFAULT '', UNIQUE(source_name, target_name, relation_type))")
+        conn.execute("CREATE TABLE IF NOT EXISTS kg_mentions (id INTEGER PRIMARY KEY AUTOINCREMENT, entity_name TEXT NOT NULL, session_id TEXT DEFAULT '', context TEXT DEFAULT '', mentioned_at TEXT DEFAULT (datetime('now')))")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_kg_mentions_entity ON kg_mentions(entity_name)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_kg_mentions_session ON kg_mentions(session_id)")
+        try:
+            conn.execute("ALTER TABLE entities ADD COLUMN description TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE entities ADD COLUMN mention_count INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS entity_fts USING fts5(name, entity_type, description, content='entities', content_rowid='rowid')")
+        conn.commit()
+    finally:
+        conn.close()
+
+_init_kg_tables()
+
+class EntityUpsert(BaseModel):
+    name: str
+    entity_type: str = "concept"
+    description: str = ""
+    attributes: Dict[str, Any] = Field(default_factory=dict)
+
+class RelationshipCreate(BaseModel):
+    source: str
+    target: str
+    relation_type: str = "related_to"
+    description: str = ""
+    session_id: str = ""
+
+class MentionCreate(BaseModel):
+    entity_name: str
+    session_id: str = ""
+    context: str = ""
+
+class BulkMigrate(BaseModel):
+    entities: List[Dict[str, Any]] = []
+    relationships: List[Dict[str, Any]] = []
+    mentions: List[Dict[str, Any]] = []
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+def _entity_to_dict(row) -> Dict:
+    if row is None: return None
+    d = dict(row)
+    if "attributes_json" in d:
+        try: d["attributes"] = json.loads(d["attributes_json"])
+        except: d["attributes"] = {}
+        del d["attributes_json"]
+    if "meta" in d:
+        try: d["meta"] = json.loads(d["meta"])
+        except: d["meta"] = {}
+    return d
+
+def _rebuild_fts(conn):
+    try: conn.execute("INSERT INTO entity_fts(entity_fts) VALUES('rebuild')")
+    except: pass
+
+@router.post("/entity")
+async def upsert_entity(data: EntityUpsert):
+    conn = _get_conn()
+    try:
+        now = _now()
+        existing = conn.execute("SELECT id FROM entities WHERE name = ? COLLATE NOCASE", (data.name,)).fetchone()
+        if existing:
+            conn.execute("UPDATE entities SET entity_type = COALESCE(?, entity_type), description = COALESCE(?, description), attributes_json = ?, last_seen = ?, mention_count = COALESCE(mention_count, 0) + 1 WHERE name = ? COLLATE NOCASE",
+                (data.entity_type, data.description, json.dumps(data.attributes), now, data.name))
+            conn.commit(); _rebuild_fts(conn)
+            result = {"status": "updated", "name": data.name}
+        else:
+            eid = hashlib.sha256(f"{data.name}:{data.entity_type}".encode()).hexdigest()[:12]
+            conn.execute("INSERT INTO entities (id, name, entity_type, description, attributes_json, first_seen, last_seen, meta, mention_count) VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 1)",
+                (eid, data.name, data.entity_type, data.description, json.dumps(data.attributes), now, now))
+            conn.commit(); _rebuild_fts(conn)
+            result = {"status": "created", "name": data.name, "id": eid}
+        # Publish entity.upserted event (non-blocking)
+        try:
+            from services.event_bus import publish
+            publish("entity.upserted", {
+                "name": data.name,
+                "entity_type": data.entity_type,
+                "action": result["status"],
+                "description": data.description or "",
+            })
+        except Exception as _be:
+            pass  # non-fatal
+        return result
+    finally:
+        conn.close()
+
+@router.get("/entity/{name}")
+async def get_entity(name: str):
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT * FROM entities WHERE name = ? COLLATE NOCASE", (name,)).fetchone()
+        if not row: raise HTTPException(404, f"Entity '{name}' not found")
+        return _entity_to_dict(row)
+    finally:
+        conn.close()
+
+@router.delete("/entity/{name}")
+async def delete_entity(name: str):
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT id FROM entities WHERE name = ? COLLATE NOCASE", (name,)).fetchone()
+        if not row: raise HTTPException(404, f"Entity '{name}' not found")
+        conn.execute("DELETE FROM entities WHERE name = ? COLLATE NOCASE", (name,))
+        conn.execute("DELETE FROM kg_relationships WHERE source_name = ? OR target_name = ?", (name, name))
+        conn.execute("DELETE FROM kg_mentions WHERE entity_name = ?", (name,))
+        conn.commit(); _rebuild_fts(conn)
+        return {"status": "deleted", "name": name}
+    finally:
+        conn.close()
+
+@router.get("/search")
+async def search_entities(q: str = Query(""), entity_type: str = Query(""), limit: int = Query(20, ge=1, le=100)):
+    conn = _get_conn()
+    try:
+        if q:
+            try:
+                rows = conn.execute("SELECT e.* FROM entities e JOIN entity_fts f ON e.rowid = f.rowid WHERE entity_fts MATCH ? ORDER BY rank LIMIT ?", (q, limit)).fetchall()
+            except:
+                rows = conn.execute("SELECT * FROM entities WHERE name LIKE ? OR description LIKE ? LIMIT ?", (f"%{q}%", f"%{q}%", limit)).fetchall()
+        elif entity_type:
+            rows = conn.execute("SELECT * FROM entities WHERE entity_type = ? ORDER BY mention_count DESC LIMIT ?", (entity_type, limit)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM entities ORDER BY mention_count DESC LIMIT ?", (limit,)).fetchall()
+        return {"results": [_entity_to_dict(r) for r in rows], "count": len(rows)}
+    finally:
+        conn.close()
+
+@router.get("/graph/{name}")
+async def get_graph(name: str):
+    conn = _get_conn()
+    try:
+        entity = conn.execute("SELECT * FROM entities WHERE name = ? COLLATE NOCASE", (name,)).fetchone()
+        if not entity: raise HTTPException(404, f"Entity '{name}' not found")
+        outgoing = conn.execute("SELECT target_name, relation_type, description FROM kg_relationships WHERE source_name = ? COLLATE NOCASE", (name,)).fetchall()
+        incoming = conn.execute("SELECT source_name, relation_type, description FROM kg_relationships WHERE target_name = ? COLLATE NOCASE", (name,)).fetchall()
+        mentions = conn.execute("SELECT session_id, context, mentioned_at FROM kg_mentions WHERE entity_name = ? COLLATE NOCASE ORDER BY mentioned_at DESC LIMIT 10", (name,)).fetchall()
+        return {"entity": _entity_to_dict(entity), "outgoing": [dict(r) for r in outgoing], "incoming": [dict(r) for r in incoming], "recent_mentions": [dict(r) for r in mentions]}
+    finally:
+        conn.close()
+
+@router.post("/relationship")
+async def add_relationship(data: RelationshipCreate):
+    conn = _get_conn()
+    try:
+        conn.execute("INSERT OR REPLACE INTO kg_relationships (source_name, target_name, relation_type, description, session_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (data.source, data.target, data.relation_type, data.description, data.session_id, _now()))
+        conn.commit()
+        return {"status": "created", "source": data.source, "target": data.target, "type": data.relation_type}
+    finally:
+        conn.close()
+
+@router.post("/mention")
+async def record_mention(data: MentionCreate):
+    conn = _get_conn()
+    try:
+        conn.execute("INSERT INTO kg_mentions (entity_name, session_id, context, mentioned_at) VALUES (?, ?, ?, ?)", (data.entity_name, data.session_id, data.context, _now()))
+        conn.execute("UPDATE entities SET mention_count = COALESCE(mention_count, 0) + 1, last_seen = ? WHERE name = ? COLLATE NOCASE", (_now(), data.entity_name))
+        conn.commit()
+        return {"status": "recorded", "entity": data.entity_name}
+    finally:
+        conn.close()
+
+@router.get("/stats")
+async def get_stats():
+    conn = _get_conn()
+    try:
+        entities = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+        rels = conn.execute("SELECT COUNT(*) FROM kg_relationships").fetchone()[0]
+        ments = conn.execute("SELECT COUNT(*) FROM kg_mentions").fetchone()[0]
+        by_type = {}
+        for row in conn.execute("SELECT entity_type, COUNT(*) FROM entities GROUP BY entity_type").fetchall():
+            by_type[row[0]] = row[1]
+        top = conn.execute("SELECT name, entity_type, mention_count FROM entities ORDER BY mention_count DESC LIMIT 10").fetchall()
+        return {"entities": entities, "relationships": rels, "mentions": ments, "by_type": by_type, "top_entities": [{"name": r[0], "type": r[1], "mentions": r[2]} for r in top]}
+    finally:
+        conn.close()
+
+@router.post("/migrate")
+async def bulk_migrate(data: BulkMigrate):
+    conn = _get_conn()
+    try:
+        e_ok = 0
+        for e in data.entities:
+            try:
+                eid = e.get("id") or hashlib.sha256(f"{e['name']}:{e.get('entity_type','')}".encode()).hexdigest()[:12]
+                conn.execute("INSERT OR REPLACE INTO entities (id, name, entity_type, description, attributes_json, first_seen, last_seen, meta, mention_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (eid, e["name"], e.get("entity_type", "concept"), e.get("description", ""), json.dumps(e.get("attributes", {})), e.get("first_seen", _now()), e.get("last_seen", _now()), json.dumps(e.get("meta", {})), e.get("mention_count", 0)))
+                e_ok += 1
+            except Exception as ex:
+                logger.warning(f"Entity import failed: {e.get('name')}: {ex}")
+        r_ok = 0
+        for r in data.relationships:
+            try:
+                conn.execute("INSERT OR REPLACE INTO kg_relationships (source_name, target_name, relation_type, description, session_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (r["source_name"], r["target_name"], r.get("relation_type", "related_to"), r.get("description", ""), r.get("session_id", ""), r.get("created_at", _now())))
+                r_ok += 1
+            except Exception as ex:
+                logger.warning(f"Relationship import: {ex}")
+        m_ok = 0
+        for m in data.mentions:
+            try:
+                conn.execute("INSERT INTO kg_mentions (entity_name, session_id, context, mentioned_at) VALUES (?, ?, ?, ?)",
+                    (m["entity_name"], m.get("session_id", ""), m.get("context", ""), m.get("mentioned_at", _now())))
+                m_ok += 1
+            except Exception as ex:
+                if m_ok < 5: logger.warning(f"Mention import: {ex}")
+        conn.commit()
+        _rebuild_fts(conn)
+        return {"status": "migrated", "entities": e_ok, "relationships": r_ok, "mentions": m_ok}
+    finally:
+        conn.close()

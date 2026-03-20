@@ -1,0 +1,109 @@
+"""Retention policy for Helix Cortex.
+
+Prunes old data based on configurable retention periods.
+Can be triggered via API or run on a schedule.
+
+Default retention:
+- structured_archive (decisions): 365 days
+- structured_archive (failures): 365 days
+- structured_archive (patterns): 365 days
+- structured_archive (sessions): 180 days
+- structured_archive (snapshots): 30 days
+- structured_archive (entities): never
+- observer_actions: 90 days
+- observer_file_captures: 90 days
+- observer_session_tokens: 180 days
+- observer_sequences: 365 days
+- kb_documents: never (always current)
+- conversations (FTS): never (historical value)
+- knowledge graph: never
+"""
+import sqlite3
+from services import pg_sync
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Dict
+from services.database import get_db_path
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_RETENTION_DAYS = {
+    # structured_archive by collection
+    "archive:decisions": 365,
+    "archive:failures": 365,
+    "archive:patterns": 365,
+    "archive:sessions": 180,
+    "archive:snapshots": 30,
+    "archive:project_archive": 365,
+    "archive:entities": 0,  # 0 = never prune
+    # observer tables
+    "observer_actions": 90,
+    "observer_file_captures": 90,
+    "observer_session_tokens": 180,
+    "observer_sequences": 365,
+    "observer_exchanges": 180,
+}
+
+
+def run_retention(overrides: Dict[str, int] = None) -> Dict:
+    """Run retention policies. Returns counts of deleted items."""
+    retention = {**DEFAULT_RETENTION_DAYS}
+    if overrides:
+        retention.update(overrides)
+    
+    conn = pg_sync.sqlite_conn(str(get_db_path()), timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    results = {}
+    
+    try:
+        # Structured archive - prune by collection + timestamp
+        for key, days in retention.items():
+            if not key.startswith("archive:") or days == 0:
+                continue
+            collection = key.split(":", 1)[1]
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            try:
+                cursor = conn.execute(
+                    "DELETE FROM structured_archive WHERE collection = ? AND timestamp != '' AND timestamp < ?",
+                    (collection, cutoff)
+                )
+                results[key] = cursor.rowcount
+            except Exception as e:
+                results[key] = f"error: {e}"
+        
+        # Observer tables
+        observer_tables = {
+            "observer_actions": ("timestamp", retention.get("observer_actions", 90)),
+            "observer_file_captures": ("created_at", retention.get("observer_file_captures", 90)),
+            "observer_session_tokens": ("timestamp", retention.get("observer_session_tokens", 180)),
+            "observer_sequences": ("last_seen", retention.get("observer_sequences", 365)),
+            "observer_exchanges": ("timestamp", retention.get("observer_exchanges", 180)),
+        }
+        for table, (ts_col, days) in observer_tables.items():
+            if days == 0:
+                continue
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            try:
+                cursor = conn.execute(
+                    f"DELETE FROM {table} WHERE {ts_col} < ?",
+                    (cutoff,)
+                )
+                results[table] = cursor.rowcount
+            except Exception as e:
+                results[table] = f"error: {e}"
+        
+        conn.commit()
+        
+        # Rebuild FTS indexes after deleting
+        for fts_table in ['structured_fts', 'kb_fts']:
+            try:
+                conn.execute(f"INSERT INTO {fts_table}({fts_table}) VALUES('rebuild')")
+            except:
+                pass
+        conn.commit()
+        
+    finally:
+        conn.close()
+    
+    logger.info(f"Retention completed: {results}")
+    return results

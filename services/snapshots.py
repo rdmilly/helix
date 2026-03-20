@@ -1,0 +1,272 @@
+"""
+snapshots.py - Component Snapshot Service
+
+Generates and manages point-in-time snapshots of system components.
+Solves the refamiliarization problem: instead of re-reading source files
+at session start, load the component's snapshot doc.
+
+Snapshot schema (snapshots table):
+  id, target_table, target_id, content, created_at
+
+Snapshot queue schema (snapshot_queue table):
+  id, target_table, target_id, reason, queued_at, processed_at
+
+Triggered by:
+  - helix_file_write (code file changed -> queue snapshot for that component)
+  - session end (queue snapshot of active project state)
+  - Manual via POST /api/v1/observer/snapshot
+"""
+
+import json
+import logging
+import sqlite3
+from services import pg_sync
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Dict, Any
+
+log = logging.getLogger("helix.snapshots")
+
+DB_PATH = "/app/data/cortex.db"
+
+# Component to file mapping (path prefix -> component name)
+COMPONENT_MAP = {
+    "/opt/projects/helix/routers/ext_ingest": "ext-ingest",
+    "/opt/projects/helix/routers/observer": "observer",
+    "/opt/projects/helix/routers/archive": "archive",
+    "/opt/projects/helix/services/synapse": "synapse",
+    "/opt/projects/helix/services/haiku": "haiku",
+    "/opt/projects/helix/services/workbench": "workbench",
+    "/opt/projects/helix/services/chromadb": "chromadb-service",
+    "/opt/projects/helix/services/snapshots": "snapshots",
+    "/opt/projects/helix/services/observer": "observer",
+    "/opt/projects/helix/services/scanner": "scanner",
+    "/opt/projects/helix/mcp_tools": "mcp-tools",
+    "/opt/projects/helix/main": "helix-cortex",
+    "/opt/projects/helix": "helix-cortex",
+    "/opt/projects/the-forge": "forge",
+    "/opt/projects/provisioner": "provisioner",
+    "/opt/projects/memory-ext": "membrain",
+}
+
+# Components with known roles and descriptions
+COMPONENT_ROLES = {
+    "ext-ingest": "Receives MemBrain Chrome extension flushes. Summarizes via Haiku, extracts 9-tag intelligence, routes to all DB tables and ChromaDB.",
+    "synapse": "Context assembly engine. Searches atoms, sessions, intelligence, conversation chunks. Builds injection_text for MemBrain inject.",
+    "haiku": "Anthropic Haiku wrapper. extract_intelligence(), extract_entities(), summarize_session(). Core AI brain of Helix.",
+    "observer": "Tool call logger. Receives action logs from provision-filter. Tracks sequences, extracts facts, processes file captures.",
+    "workbench": "Unified write layer. Pipeline: write->version->scan->index->KG->observe->topology->snapshot. Called by helix_file_write.",
+    "chromadb-service": "Vector storage. 5 collections: atoms, sessions, entities, conversations, intelligence. BGE-large embeddings.",
+    "mcp-tools": "MCP tool definitions exposed to Claude. helix_file_write, helix_file_read, helix_search, entity_upsert, etc.",
+    "forge": "Pattern catalog and versioning. Workspace CRUD + MinIO versioning + atom scanning. 989 atoms, 113 molecules.",
+    "provisioner": "MCP gateway router. 45 servers, 697 tools. Routes tool calls, logs to observer.",
+    "membrain": "Chrome extension. Captures conversation turns, flushes to ext_ingest every 2min. Also does context inject.",
+    "helix-cortex": "Main FastAPI app. Port 9050. Hosts all routers. Entry point for all Helix operations.",
+    "snapshots": "Snapshot service. Generates component documentation on file changes. Solves refamiliarization.",
+}
+
+
+def _db() -> sqlite3.Connection:
+    conn = pg_sync.sqlite_conn(DB_PATH, timeout=10)
+    return conn
+
+
+def component_from_path(file_path: str) -> Optional[str]:
+    """Map a file path to its component name."""
+    for prefix, component in COMPONENT_MAP.items():
+        if file_path.startswith(prefix):
+            return component
+    return None
+
+
+def queue_snapshot(target_table: str, target_id: str, reason: str = "file_changed") -> bool:
+    """Add a component to the snapshot queue."""
+    try:
+        conn = _db()
+        # Check if already queued (avoid duplicates)
+        existing = conn.execute(
+            "SELECT id FROM snapshot_queue WHERE target_table=? AND target_id=? AND processed_at IS NULL",
+            (target_table, target_id)
+        ).fetchone()
+        if not existing:
+            conn.execute(
+                "INSERT INTO snapshot_queue (target_table, target_id, reason, queued_at) VALUES (?,?,?,?)",
+                (target_table, target_id, reason, datetime.now(timezone.utc).isoformat())
+            )
+            conn.commit()
+            log.info(f"Snapshot queued: {target_table}/{target_id} ({reason})")
+            return True
+        return False
+    except Exception as e:
+        log.warning(f"Snapshot queue failed: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def queue_snapshot_for_file(file_path: str, context: str = "") -> Optional[str]:
+    """Queue a snapshot for the component owning a file. Returns component name or None."""
+    component = component_from_path(file_path)
+    if component:
+        reason = f"file_changed:{Path(file_path).name}"
+        if context:
+            reason += f" context:{context[:60]}"
+        queue_snapshot("components", component, reason)
+        return component
+    return None
+
+
+async def generate_snapshot(component: str, file_path: Optional[str] = None, file_content: Optional[str] = None) -> Optional[str]:
+    """
+    Generate a snapshot document for a component using Haiku.
+    Returns the snapshot content string or None on failure.
+    """
+    import sys
+    sys.path.insert(0, "/app")
+    try:
+        from services.haiku import get_haiku_service
+        haiku = get_haiku_service()
+    except Exception as e:
+        log.warning(f"Haiku unavailable for snapshot: {e}")
+        return None
+
+    role = COMPONENT_ROLES.get(component, "Unknown component.")
+
+    # Gather context: recent intelligence items for this component
+    context_items = []
+    try:
+        conn = _db()
+        rows = conn.execute(
+            """SELECT content, metadata_json FROM structured_archive
+               WHERE collection='intelligence' AND metadata_json LIKE ?
+               ORDER BY created_at DESC LIMIT 10""",
+            (f'%"component": "{component}"%',)
+        ).fetchall()
+        for r in rows:
+            meta = pg_sync.dejson(r[1]) if r[1] else {}
+            tag = meta.get("tag", "")
+            if tag:
+                context_items.append(f"[{tag}] {r[0]}")
+        conn.close()
+    except Exception:
+        pass
+
+    # Build prompt
+    code_excerpt = ""
+    if file_content:
+        code_excerpt = f"\n\nMost recent file content (first 2000 chars):\n```python\n{file_content[:2000]}\n```"
+
+    intel_block = ""
+    if context_items:
+        intel_block = "\n\nKnown intelligence for this component:\n" + "\n".join(context_items[:8])
+
+    prompt = f"""Generate a concise component snapshot document for: {component}
+
+Known role: {role}{intel_block}{code_excerpt}
+
+Output a markdown document with these sections:
+## Component: {component}
+**Role:** (one sentence)
+**Status:** (active/building/stable/broken)
+**Entry points:** (list public functions/routes/classes)
+**Data owned:** (DB tables/ChromaDB collections this component writes to)
+**Calls out to:** (external services/modules it depends on)
+**Key invariants:** (things that must always be true)
+**Known risks:** (open risks or fragile areas)
+**Last changed:** (reason for most recent change, if known)
+
+Keep it under 400 words. Be specific, not generic."""
+
+    try:
+        system = "You are a technical documentation assistant. Generate concise, accurate component snapshot documents based on the information provided."
+        content = await haiku._call_api(system, prompt, max_tokens=600)
+        if content:
+            log.info(f"Snapshot generated for {component}: {len(content)} chars")
+            return content
+    except Exception as e:
+        log.warning(f"Snapshot generation failed for {component}: {e}")
+
+    return None
+
+
+async def process_snapshot_queue(limit: int = 5) -> Dict[str, Any]:
+    """
+    Process pending snapshots from the queue.
+    Called periodically or after file writes.
+    Returns count of processed snapshots.
+    """
+    processed = 0
+    failed = 0
+    try:
+        conn = _db()
+        rows = conn.execute(
+            """SELECT id, target_table, target_id, reason FROM snapshot_queue
+               WHERE processed_at IS NULL ORDER BY queued_at ASC LIMIT ?""",
+            (limit,)
+        ).fetchall()
+        conn.close()
+    except Exception as e:
+        log.error(f"Snapshot queue read failed: {e}")
+        return {"processed": 0, "failed": 0, "error": str(e)}
+
+    for row in rows:
+        queue_id, target_table, target_id, reason = row[0], row[1], row[2], row[3]
+        try:
+            content = await generate_snapshot(target_id)
+            if content:
+                now = datetime.now(timezone.utc).isoformat()
+                conn = _db()
+                # Write snapshot
+                conn.execute(
+                    "INSERT INTO snapshots (target_table, target_id, content, created_at) VALUES (?,?,?,?) ON CONFLICT DO NOTHING",
+                    (target_table, target_id, content, now)
+                )
+                # Mark queue item processed
+                conn.execute(
+                    "UPDATE snapshot_queue SET processed_at=? WHERE id=?",
+                    (now, queue_id)
+                )
+                conn.commit()
+                conn.close()
+                processed += 1
+                log.info(f"Snapshot written: {target_table}/{target_id}")
+            else:
+                failed += 1
+        except Exception as e:
+            log.error(f"Snapshot processing failed for {target_id}: {e}")
+            failed += 1
+
+    return {"processed": processed, "failed": failed, "queued": len(rows)}
+
+
+def get_snapshot(component: str) -> Optional[str]:
+    """Get the most recent snapshot for a component."""
+    try:
+        conn = _db()
+        row = conn.execute(
+            """SELECT content, created_at FROM snapshots
+               WHERE target_table='components' AND target_id=?
+               ORDER BY created_at DESC LIMIT 1""",
+            (component,)
+        ).fetchone()
+        conn.close()
+        if row:
+            return {"content": row[0], "created_at": row[1], "component": component}
+    except Exception as e:
+        log.warning(f"Snapshot read failed: {e}")
+    return None
+
+
+def list_snapshots() -> list:
+    """List all components with snapshots."""
+    try:
+        conn = _db()
+        rows = conn.execute(
+            """SELECT target_id, created_at, length(content) as size
+               FROM snapshots WHERE target_table='components'
+               ORDER BY created_at DESC"""
+        ).fetchall()
+        conn.close()
+        return [{"component": r[0], "created_at": r[1], "size": r[2]} for r in rows]
+    except Exception:
+        return []

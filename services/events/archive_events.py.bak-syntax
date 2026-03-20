@@ -1,0 +1,130 @@
+"""Archive Event Handlers - archive.recorded subscriber
+
+Fired when a record is added to structured_archive via exchange intelligence.
+Subscribers:
+- nudge_generator : decisions -> create actionable follow-up nudge
+- anomaly_detector: failures -> detect spikes and create anomaly records
+"""
+import json
+import logging
+import uuid
+from typing import Any, Dict
+
+log = logging.getLogger("helix.events.archive")
+
+
+async def handle_archive_recorded(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle archive.recorded event.
+
+    Payload keys:
+      record_id   - ID of the structured_archive row
+      collection  - 'decisions' | 'failures' | 'patterns'
+      content     - text content that was archived
+      session_id  - originating session
+      exchange_id - originating exchange
+    """
+    collection  = payload.get("collection", "")
+    content     = payload.get("content", "")
+    session_id  = payload.get("session_id", "")
+    record_id   = payload.get("record_id", "")
+    exchange_id = payload.get("exchange_id", "")
+
+    log.debug(f"archive.recorded: {collection} - {record_id}")
+
+    results = {}
+
+    # ------------------------------------------------------------------ #
+    # Nudge generator - decisions get a follow-up nudge
+    # ------------------------------------------------------------------ #
+    if collection == "decisions" and content:
+        try:
+            from services.database import get_db
+            db = get_db()
+            nudge_id = f"nudge_{uuid.uuid4().hex[:12]}"
+            summary = content[:200] + ("..." if len(content) > 200 else "")
+            with db.get_connection() as conn:
+                conn.execute(
+                    """INSERT OR IGNORE INTO nudges
+                       (id, description, category, priority, state, session_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, datetime('now'))""",
+                    (nudge_id,
+                     f"Follow up on decision: {summary}",
+                     "decision_followup",
+                     "LOW",
+                     "active",
+                     session_id)
+                )
+                conn.commit()
+            results["nudge_generator"] = {"status": "created", "nudge_id": nudge_id}
+        except Exception as e:
+            log.debug(f"nudge_generator failed (non-fatal): {e}")
+            results["nudge_generator"] = {"status": "error", "error": str(e)}
+    else:
+        results["nudge_generator"] = {"status": "skipped", "reason": f"collection={collection}"}
+
+    # ------------------------------------------------------------------ #
+    # Anomaly detector - failure rate spike detection
+    # ------------------------------------------------------------------ #
+    if collection == "failures" and content:
+        try:
+            from services.database import get_db
+            db = get_db()
+            with db.get_connection() as conn:
+                recent_count = conn.execute(
+                    """SELECT COUNT(*) FROM structured_archive
+                       WHERE collection = 'failures'
+                         AND created_at > datetime('now', '-1 hour')"""
+                ).fetchone()[0]
+
+                if recent_count >= 3:
+                    existing_anom = conn.execute(
+                        """SELECT id FROM anomalies
+                           WHERE type = 'failure_spike' AND state = 'active'
+                             AND created_at > datetime('now', '-1 hour')"""
+                    ).fetchone()
+
+                    if not existing_anom:
+                        anomaly_id = f"anom_{uuid.uuid4().hex[:12]}"
+                        conn.execute(
+                            """INSERT OR IGNORE INTO anomalies
+                               (id, type, description, evidence, severity, state, session_id, created_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+                            (anomaly_id,
+                             "failure_spike",
+                             f"Failure rate spike: {recent_count} failures in last hour",
+                             json.dumps({"recent_count": recent_count,
+                                         "trigger_record": record_id,
+                                         "exchange_id": exchange_id}),
+                             "HIGH",
+                             "active",
+                             session_id)
+                        )
+                        conn.commit()
+                        results["anomaly_detector"] = {
+                            "status": "anomaly_created",
+                            "anomaly_id": anomaly_id,
+                            "recent_count": recent_count,
+                        }
+                        log.warning(f"Failure spike anomaly: {recent_count} failures/hr")
+                    else:
+                        results["anomaly_detector"] = {
+                            "status": "existing_open",
+                            "anomaly_id": existing_anom[0],
+                        }
+                else:
+                    results["anomaly_detector"] = {
+                        "status": "ok",
+                        "recent_failures": recent_count,
+                    }
+        except Exception as e:
+            log.debug(f"anomaly_detector failed (non-fatal): {e}")
+            results["anomaly_detector"] = {"status": "error", "error": str(e)}
+    else:
+        results["anomaly_detector"] = {"status": "skipped", "reason": f"collection={collection}"}
+
+    return {
+        "event": "archive.recorded",
+        "collection": collection,
+        "record_id": record_id,
+        "results": results,
+    }

@@ -1,0 +1,285 @@
+"""ChromaDB Service - Vector Storage via HTTP (Lightweight)
+
+Phase 2+: Direct HTTP client to ChromaDB REST API with pre-computed embeddings.
+No heavy chromadb package needed -- just httpx + fastembed.
+
+Model-versioned collections, fan-out search, embedding storage.
+Circuit breaker for graceful degradation.
+"""
+import json
+import logging
+import time
+from typing import List, Dict, Any, Optional
+
+import httpx
+
+from config import CHROMADB_HOST, CHROMADB_PORT, CURRENT_EMBEDDING_MODEL, EMBEDDING_DIMENSIONS
+
+logger = logging.getLogger(__name__)
+
+
+class CircuitBreaker:
+    """Circuit breaker for ChromaDB connections."""
+    
+    def __init__(self, threshold: int = 3, timeout: int = 120):
+        self.threshold = threshold
+        self.timeout = timeout
+        self.failure_count = 0
+        self.last_failure_time = 0.0
+        self.is_open = False
+    
+    def record_failure(self):
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.failure_count >= self.threshold:
+            self.is_open = True
+            logger.error(f"ChromaDB circuit breaker opened after {self.failure_count} failures")
+    
+    def record_success(self):
+        self.failure_count = 0
+        if self.is_open:
+            self.is_open = False
+            logger.info("ChromaDB circuit breaker closed")
+    
+    def can_execute(self) -> bool:
+        if not self.is_open:
+            return True
+        if time.time() - self.last_failure_time > self.timeout:
+            return True
+        return False
+
+
+class ChromaDBService:
+    """Lightweight ChromaDB HTTP client using httpx + fastembed.
+    
+    Collections are named: helix_{base}_{model}
+    e.g. helix_atoms_bge-m3, helix_sessions_bge-m3
+    
+    All embeddings are pre-computed via EmbeddingService before
+    storage and search -- ChromaDB is used as a pure vector store.
+    """
+    
+    def __init__(self):
+        self.host = CHROMADB_HOST
+        self.port = CHROMADB_PORT
+        self.current_model = CURRENT_EMBEDDING_MODEL
+        self.base_url = f"http://{self.host}:{self.port}"
+        self.circuit_breaker = CircuitBreaker()
+        self._initialized = False
+        self._client: Optional[httpx.AsyncClient] = None
+        self._collection_ids: Dict[str, str] = {}
+        self._embedder = None  # Lazy import to avoid circular deps
+    
+    def _get_embedder(self):
+        """Lazy-load embedding service to avoid circular imports."""
+        if self._embedder is None:
+            from services.embeddings import get_embedding_service
+            self._embedder = get_embedding_service()
+        return self._embedder
+    
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=httpx.Timeout(10.0),
+            )
+        return self._client
+    
+    async def initialize(self) -> bool:
+        """Initialize connection and create/get collections."""
+        if not self.circuit_breaker.can_execute():
+            logger.warning("ChromaDB circuit breaker open, skipping init")
+            return False
+        
+        try:
+            client = await self._get_client()
+            
+            # Heartbeat check
+            resp = await client.get("/api/v1/heartbeat")
+            if resp.status_code != 200:
+                raise ConnectionError(f"ChromaDB heartbeat failed: {resp.status_code}")
+            
+            # Create model-versioned collections
+            for base_name in ("atoms", "sessions", "entities", "conversations", "intelligence"):
+                collection_name = f"helix_{base_name}_{self.current_model}"
+                try:
+                    resp = await client.post("/api/v1/collections", json={
+                        "name": collection_name,
+                        "metadata": {
+                            "embedding_model": self.current_model,
+                            "dimensions": str(EMBEDDING_DIMENSIONS),
+                            "created_by": "helix_cortex_v3",
+                        },
+                        "get_or_create": True,
+                    })
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        self._collection_ids[base_name] = data.get("id", "")
+                        logger.info(f"ChromaDB collection ready: {collection_name}")
+                    else:
+                        logger.warning(f"Failed to create collection {collection_name}: {resp.status_code}")
+                except Exception as e:
+                    logger.warning(f"Failed to create collection {collection_name}: {e}")
+            
+            self.circuit_breaker.record_success()
+            self._initialized = True
+            logger.info(f"ChromaDB initialized: {self.base_url} ({len(self._collection_ids)} collections)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"ChromaDB initialization failed: {e}")
+            self.circuit_breaker.record_failure()
+            return False
+    
+    async def add_document(
+        self,
+        collection_base: str,
+        doc_id: str,
+        text: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Add a document with pre-computed embeddings to a collection."""
+        if not self._initialized or not self.circuit_breaker.can_execute():
+            return False
+        
+        collection_id = self._collection_ids.get(collection_base)
+        if not collection_id:
+            return False
+        
+        # Compute embedding
+        embedder = self._get_embedder()
+        if not embedder.is_ready:
+            logger.warning(f"Embedding service not ready, skipping upsert for {doc_id}")
+            return False
+        
+        embedding = embedder.embed_single(text[:10000])
+        if not embedding:
+            logger.warning(f"Failed to compute embedding for {doc_id}")
+            return False
+        
+        try:
+            client = await self._get_client()
+            clean_meta = self._clean_metadata(metadata or {})
+            clean_meta["embedding_model"] = self.current_model
+            
+            resp = await client.post(f"/api/v1/collections/{collection_id}/upsert", json={
+                "ids": [doc_id],
+                "documents": [text[:10000]],
+                "embeddings": [embedding],
+                "metadatas": [clean_meta],
+            })
+            
+            if resp.status_code == 200:
+                self.circuit_breaker.record_success()
+                return True
+            else:
+                logger.warning(f"ChromaDB upsert failed: {resp.status_code} {resp.text[:200]}")
+                self.circuit_breaker.record_failure()
+                return False
+                
+        except Exception as e:
+            logger.error(f"ChromaDB add failed for {doc_id}: {e}")
+            self.circuit_breaker.record_failure()
+            return False
+    
+    async def search_similar(
+        self,
+        query: str,
+        collection_base: str = "atoms",
+        limit: int = 10,
+        where: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Semantic search using pre-computed query embeddings."""
+        if not self._initialized or not self.circuit_breaker.can_execute():
+            return []
+        
+        collection_id = self._collection_ids.get(collection_base)
+        if not collection_id:
+            return []
+        
+        # Compute query embedding
+        embedder = self._get_embedder()
+        if not embedder.is_ready:
+            logger.warning("Embedding service not ready, cannot search")
+            return []
+        
+        query_embedding = embedder.embed_single(query)
+        if not query_embedding:
+            logger.warning("Failed to compute query embedding")
+            return []
+        
+        try:
+            client = await self._get_client()
+            body: Dict[str, Any] = {
+                "query_embeddings": [query_embedding],
+                "n_results": limit,
+                "include": ["documents", "metadatas", "distances"],
+            }
+            if where:
+                body["where"] = where
+            
+            resp = await client.post(f"/api/v1/collections/{collection_id}/query", json=body)
+            
+            if resp.status_code != 200:
+                logger.warning(f"ChromaDB query failed: {resp.status_code} {resp.text[:200]}")
+                return []
+            
+            data = resp.json()
+            self.circuit_breaker.record_success()
+            
+            results = []
+            if data.get("ids") and data["ids"][0]:
+                for i, doc_id in enumerate(data["ids"][0]):
+                    results.append({
+                        "id": doc_id,
+                        "distance": data["distances"][0][i] if data.get("distances") else None,
+                        "document": data["documents"][0][i] if data.get("documents") else None,
+                        "metadata": data["metadatas"][0][i] if data.get("metadatas") else None,
+                    })
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"ChromaDB search failed: {e}")
+            self.circuit_breaker.record_failure()
+            return []
+    
+    async def health_check(self) -> bool:
+        """Check if ChromaDB is reachable."""
+        if not self.circuit_breaker.can_execute():
+            return False
+        
+        try:
+            client = await self._get_client()
+            resp = await client.get("/api/v1/heartbeat")
+            if resp.status_code == 200:
+                self.circuit_breaker.record_success()
+                return True
+            self.circuit_breaker.record_failure()
+            return False
+        except Exception:
+            self.circuit_breaker.record_failure()
+            return False
+    
+    def _clean_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Clean metadata -- ChromaDB only accepts str, int, float, bool."""
+        clean = {}
+        for key, value in metadata.items():
+            if isinstance(value, (str, int, float, bool)):
+                clean[key] = value
+            elif isinstance(value, (list, dict)):
+                clean[key] = json.dumps(value)
+            elif value is None:
+                clean[key] = ""
+            else:
+                clean[key] = str(value)
+        return clean
+
+
+# Global service instance
+chromadb_service = ChromaDBService()
+
+
+def get_chromadb_service() -> ChromaDBService:
+    """Get ChromaDB service instance"""
+    return chromadb_service

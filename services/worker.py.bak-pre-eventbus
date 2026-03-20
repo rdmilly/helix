@@ -1,0 +1,551 @@
+"""Worker Service - Mitochondria Processing Pipeline
+
+Background worker that processes the SQLite-backed queue.
+Pulls pending items, classifies content, routes through handlers, stores results.
+
+Content type routing:
+  CODE    → ScannerService (AST extraction, fingerprinting, atom creation)
+  TEXT    → HaikuService (summarization, entity extraction, decisions)
+  ACTIONS → ParserService (tool calls, file ops, command parsing)
+  CHANGES → ParserService (git commits, config changes, infra changes)
+
+All processing enriches epigenetic meta namespaces.
+"""
+import asyncio
+import json
+import logging
+import re
+import uuid
+from datetime import datetime
+from typing import Dict, Any, Optional, List, Tuple
+
+from services.database import get_db
+from services.scanner import get_scanner_service
+from services.haiku import get_haiku_service
+from services.chromadb import get_chromadb_service
+from services.parser import get_parser_service
+from services.meta import get_meta_service
+from services.registry import get_registry_service
+from config import MAX_RETRY_ATTEMPTS
+from services.diff import get_diff_service
+
+logger = logging.getLogger(__name__)
+
+# Worker configuration
+POLL_INTERVAL = 5  # seconds between queue checks
+BATCH_SIZE = 10    # max items to process per poll
+SHUTDOWN_TIMEOUT = 30  # seconds to wait for graceful shutdown
+
+# Code fence pattern: ```language\ncode\n```
+CODE_FENCE_RE = re.compile(
+    r'```(\w*)\s*\n(.*?)```',
+    re.DOTALL
+)
+
+# Language hints for code detection
+CODE_LANGUAGES = {
+    "python", "py", "javascript", "js", "typescript", "ts",
+    "rust", "go", "java", "c", "cpp", "ruby", "bash", "sh",
+    "sql", "html", "css", "yaml", "toml", "json", "dockerfile",
+}
+
+
+def extract_code_blocks(text: str) -> List[Tuple[str, str]]:
+    """Extract code blocks from markdown-fenced text.
+
+    Returns list of (language, code) tuples.
+    Handles ```python\ncode\n``` format.
+    """
+    blocks = []
+    for match in CODE_FENCE_RE.finditer(text):
+        lang = match.group(1).lower().strip()
+        code = match.group(2).strip()
+        if code and len(code) > 20:  # Skip trivial snippets
+            # Default to python if no language specified but looks like code
+            if not lang or lang not in CODE_LANGUAGES:
+                lang = "python"
+            blocks.append((lang, code))
+    return blocks
+
+
+def extract_code_from_messages(messages: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+    """Extract code blocks from conversation messages.
+
+    Scans assistant messages for fenced code blocks.
+    Returns list of (language, code) tuples.
+    """
+    all_blocks = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            blocks = extract_code_blocks(content)
+            all_blocks.extend(blocks)
+        elif isinstance(content, list):
+            # Handle structured content (tool results, etc.)
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    blocks = extract_code_blocks(part.get("text", ""))
+                    all_blocks.extend(blocks)
+    return all_blocks
+
+
+class MitochondriaWorker:
+    """Background worker that powers the Helix processing pipeline.
+
+    Named after the cellular powerhouse — transforms raw intake
+    into enriched, classified, indexed knowledge.
+    """
+
+    def __init__(self):
+        self.db = get_db()
+        self.scanner = get_scanner_service()
+        self.haiku = get_haiku_service()
+        self.chromadb = get_chromadb_service()
+        self.parser = get_parser_service()
+        self.meta = get_meta_service()
+        self.registry = get_registry_service()
+        self.diff = get_diff_service()
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+        self._processed_count = 0
+        self._error_count = 0
+
+    async def start(self):
+        """Start the background worker loop."""
+        if self._running:
+            logger.warning("Worker already running")
+            return
+
+        self._running = True
+        self._task = asyncio.create_task(self._run_loop())
+        logger.info("🔋 Mitochondria worker started")
+
+    async def stop(self):
+        """Stop the background worker gracefully."""
+        self._running = False
+        if self._task:
+            try:
+                await asyncio.wait_for(self._task, timeout=SHUTDOWN_TIMEOUT)
+            except asyncio.TimeoutError:
+                self._task.cancel()
+                logger.warning("Worker shutdown timed out, cancelled")
+        logger.info(f"🔋 Mitochondria worker stopped ({self._processed_count} processed, {self._error_count} errors)")
+
+    async def _run_loop(self):
+        """Main processing loop — polls queue and processes items."""
+        while self._running:
+            try:
+                items = self._fetch_pending_items(BATCH_SIZE)
+
+                for item in items:
+                    if not self._running:
+                        break
+                    await self._process_item(item)
+
+                if not items:
+                    await asyncio.sleep(POLL_INTERVAL)
+                else:
+                    # Brief pause between batches
+                    await asyncio.sleep(0.5)
+
+            except Exception as e:
+                logger.error(f"Worker loop error: {e}", exc_info=True)
+                await asyncio.sleep(POLL_INTERVAL * 2)
+
+    def _fetch_pending_items(self, limit: int) -> list:
+        """Fetch pending items from queue, ordered by priority DESC, created_at ASC."""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, intake_type, content_type, payload, status, priority, attempts
+                FROM queue
+                WHERE status = 'pending' AND attempts < ?
+                ORDER BY priority DESC, created_at ASC
+                LIMIT ?
+            """, (MAX_RETRY_ATTEMPTS, limit))
+
+            items = []
+            for row in cursor.fetchall():
+                items.append({
+                    "id": row[0],
+                    "intake_type": row[1],
+                    "content_type": row[2],
+                    "payload": json.loads(row[3]),
+                    "status": row[4],
+                    "priority": row[5],
+                    "attempts": row[6],
+                })
+
+            # Mark items as processing
+            for item in items:
+                cursor.execute("""
+                    UPDATE queue SET status = 'processing', started_at = datetime('now'),
+                        attempts = attempts + 1
+                    WHERE id = ?
+                """, (item["id"],))
+
+            conn.commit()
+            return items
+
+    async def _process_item(self, item: Dict[str, Any]):
+        """Process a single queue item through the full pipeline."""
+        queue_id = item["id"]
+        intake_type = item["intake_type"]
+        payload = item["payload"]
+
+        logger.info(f"Processing {queue_id}: {intake_type}")
+
+        try:
+            # === EVENT DISPATCH (bypasses content classification) ===
+            # Events are identified by having a '.' in intake_type
+            # (file.written, session.ingested, exchange.posted, etc.)
+            from services.events.router import is_event, dispatch as dispatch_event
+            if is_event(intake_type):
+                result = await dispatch_event(intake_type, payload)
+                self._mark_complete(queue_id, result)
+                self._processed_count += 1
+                logger.info(f"Event complete {queue_id}: {intake_type}")
+                return
+
+            # Step 1: Create or find session
+            session_id = await self._ensure_session(payload)
+
+            # Step 2: Classify content (if not already classified)
+            content_type = item.get("content_type")
+            if not content_type:
+                content_type = await self._classify_content(payload)
+
+            # Step 3: Route to appropriate handler
+            result = await self._route_content(content_type, payload, session_id)
+
+            # Step 4: Extract entities and decisions (for TEXT/ACTIONS)
+            if content_type in ("TEXT", "ACTIONS"):
+                await self._extract_intelligence(payload, session_id, result)
+
+            # Step 5: Store in ChromaDB for semantic search
+            await self._store_embeddings(queue_id, content_type, payload, result)
+
+            # Step 6: Mark complete
+            self._mark_complete(queue_id, result)
+            self._processed_count += 1
+
+            logger.info(f"Completed {queue_id}: {content_type} → {result.get('action', 'processed')}")
+
+        except Exception as e:
+            logger.error(f"Failed processing {queue_id}: {e}", exc_info=True)
+            self._mark_failed(queue_id, str(e))
+            self._error_count += 1
+
+    # ============================================================
+    # Pipeline Steps
+    # ============================================================
+
+    async def _ensure_session(self, payload: Dict[str, Any]) -> Optional[str]:
+        """Create or find a session record from intake data."""
+        session_id = payload.get("session_id")
+
+        if not session_id:
+            # Generate session from context
+            session_id = f"ses_{uuid.uuid4().hex[:12]}"
+
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Check if session exists
+            cursor.execute("SELECT id FROM sessions WHERE id = ?", (session_id,))
+            if cursor.fetchone():
+                return session_id
+
+            # Create new session
+            provider = payload.get("provider", "unknown")
+            model = payload.get("model", "unknown")
+
+            cursor.execute("""
+                INSERT OR IGNORE INTO sessions (id, provider, model, significance, meta)
+                VALUES (?, ?, ?, 0, '{}')
+            """, (session_id, provider, model))
+            conn.commit()
+
+            # Write initial meta
+            self.meta.write_meta("sessions", session_id, "intake", {
+                "provider": provider,
+                "model": model,
+                "source": payload.get("source", "unknown"),
+                "created_by": "mitochondria_v1",
+            }, written_by="mitochondria_v1")
+
+            logger.info(f"Created session {session_id}")
+            return session_id
+
+    async def _classify_content(self, payload: Dict[str, Any]) -> str:
+        """Classify content type using Haiku or heuristics."""
+        # Build text to classify from payload
+        content_parts = []
+        for key in ("content", "summary", "code", "messages", "text"):
+            val = payload.get(key)
+            if val:
+                if isinstance(val, str):
+                    content_parts.append(val)
+                elif isinstance(val, list):
+                    for item in val[:10]:
+                        if isinstance(item, dict):
+                            content_parts.append(json.dumps(item)[:500])
+                        elif isinstance(item, str):
+                            content_parts.append(item[:500])
+
+        content_text = "\n".join(content_parts)[:4000]
+
+        if content_text:
+            classification = await self.haiku.classify_content(content_text)
+            return classification.get("type", "TEXT")
+
+        return "TEXT"
+
+    async def _route_content(
+        self,
+        content_type: str,
+        payload: Dict[str, Any],
+        session_id: Optional[str]
+    ) -> Dict[str, Any]:
+        """Route content to the appropriate handler based on type."""
+
+        if content_type == "CODE":
+            return await self._handle_code(payload, session_id)
+        elif content_type == "ACTIONS":
+            return await self._handle_actions(payload, session_id)
+        elif content_type == "CHANGES":
+            return await self._handle_changes(payload, session_id)
+        else:  # TEXT and fallback
+            return await self._handle_text(payload, session_id)
+
+    async def _handle_code(self, payload: Dict[str, Any], session_id: Optional[str]) -> Dict[str, Any]:
+        """Handle CODE content: AST extraction → atoms → fingerprints → meta.
+
+        Handles three code sources:
+        1. Direct code field (payload.code)
+        2. Content field (payload.content)
+        3. Code blocks extracted from conversation messages (payload.messages)
+        """
+        filepath = payload.get("filepath", "<intake>")
+        language = payload.get("language", "python")
+        all_atoms = []
+
+        # Source 1: Direct code or content field
+        code = payload.get("code") or payload.get("content", "")
+        if code and len(code.strip()) > 20:
+            atoms = await self.scanner.extract_atoms(code, language=language, filepath=filepath)
+            all_atoms.extend(atoms)
+
+        # Source 2: Extract code blocks from conversation messages
+        messages = payload.get("messages", [])
+        if messages:
+            code_blocks = extract_code_from_messages(messages)
+            for block_lang, block_code in code_blocks:
+                logger.info(f"Extracted {block_lang} code block ({len(block_code)} chars) from messages")
+                atoms = await self.scanner.extract_atoms(
+                    block_code,
+                    language=block_lang,
+                    filepath=f"<exchange:{block_lang}>"
+                )
+                all_atoms.extend(atoms)
+
+        return {
+            "action": "scanned",
+            "content_type": "CODE",
+            "atoms_created": len([a for a in all_atoms if a.get("action") == "created"]),
+            "atoms_updated": len([a for a in all_atoms if a.get("action") == "updated"]),
+            "code_blocks_found": len(payload.get("messages", [])) > 0 and len(extract_code_from_messages(payload.get("messages", []))) or 0,
+            "atoms": all_atoms,
+        }
+
+    async def _handle_text(self, payload: Dict[str, Any], session_id: Optional[str]) -> Dict[str, Any]:
+        """Handle TEXT content: summarization → entity extraction → decisions."""
+        # Build text from various payload formats
+        text = payload.get("summary") or payload.get("content") or payload.get("text", "")
+        messages = payload.get("messages", [])
+
+        result = {"action": "analyzed", "content_type": "TEXT"}
+
+        # Summarize if messages provided
+        if messages:
+            summary = await self.haiku.summarize_session(messages)
+            result["summary"] = summary
+
+            # Update session with summary
+            if session_id:
+                self.meta.write_meta("sessions", session_id, "analysis", {
+                    "summary": summary,
+                    "analyzed_at": datetime.utcnow().isoformat(),
+                }, written_by="mitochondria_v1")
+
+        # Extract entities
+        source_text = text or result.get("summary", "")
+        if source_text:
+            entities = await self.haiku.extract_entities(source_text)
+            result["entities"] = entities
+
+            # Store entities in session meta
+            if session_id and any(entities.values()):
+                self.meta.write_meta("sessions", session_id, "entities", entities,
+                                     written_by="mitochondria_v1")
+
+        # Extract decisions
+        if source_text:
+            decisions = await self.haiku.extract_decisions(source_text)
+            result["decisions"] = decisions
+
+            # Store decisions in session meta
+            if session_id and decisions:
+                self.meta.write_meta("sessions", session_id, "decisions", {
+                    "items": decisions,
+                    "count": len(decisions),
+                    "extracted_at": datetime.utcnow().isoformat(),
+                }, written_by="mitochondria_v1")
+
+        # Session diff: capture what's new vs previous session
+        if session_id:
+            try:
+                # Find the previous session
+                prev_session_id = payload.get("prev_session_id")
+                entities_data = result.get("entities", {})
+                decisions_data = result.get("decisions", []) if isinstance(result.get("decisions"), list) else []
+                self.diff.compute_and_store_session_diff(
+                    session_id=session_id,
+                    prev_session_id=prev_session_id,
+                    new_entities=entities_data if isinstance(entities_data, dict) else {},
+                    new_decisions=decisions_data,
+                    written_by="mitochondria_v1",
+                )
+            except Exception as e:
+                logger.warning(f"Session diff failed (non-blocking): {e}")
+
+        return result
+
+    async def _handle_actions(self, payload: Dict[str, Any], session_id: Optional[str]) -> Dict[str, Any]:
+        """Handle ACTIONS content: parse tool calls, file ops, commands."""
+        result = await self.parser.parse_actions(payload, session_id)
+        result["action"] = "parsed_actions"
+        result["content_type"] = "ACTIONS"
+
+        # Store entities in session meta
+        if session_id and result.get("entities_found"):
+            self.meta.write_meta("sessions", session_id, "entities", {
+                "from_actions": result["entities_found"],
+            }, written_by="mitochondria_v1")
+
+        # Store decisions
+        if session_id and result.get("decisions_found"):
+            self.meta.write_meta("sessions", session_id, "decisions", {
+                "from_actions": result["decisions_found"],
+            }, written_by="mitochondria_v1")
+
+        return result
+
+    async def _handle_changes(self, payload: Dict[str, Any], session_id: Optional[str]) -> Dict[str, Any]:
+        """Handle CHANGES content: parse commits, configs, infra changes."""
+        result = await self.parser.parse_changes(payload, session_id)
+        result["action"] = "parsed_changes"
+        result["content_type"] = "CHANGES"
+
+        # Store entities in session meta
+        if session_id and result.get("entities_found"):
+            self.meta.write_meta("sessions", session_id, "entities", {
+                "from_changes": result["entities_found"],
+            }, written_by="mitochondria_v1")
+
+        return result
+
+    async def _extract_intelligence(
+        self,
+        payload: Dict[str, Any],
+        session_id: Optional[str],
+        result: Dict[str, Any]
+    ):
+        """Additional intelligence extraction pass (entities + decisions)."""
+        # This runs for TEXT and ACTIONS types to catch anything
+        # the primary handler might have missed
+        pass  # Primary handlers already do entity/decision extraction
+
+    async def _store_embeddings(
+        self,
+        queue_id: str,
+        content_type: str,
+        payload: Dict[str, Any],
+        result: Dict[str, Any]
+    ):
+        """Store processed content in ChromaDB for semantic search."""
+        if content_type == "CODE" and result.get("atoms"):
+            # Store each atom individually
+            for atom in result.get("atoms", []):
+                if atom.get("action") == "created":
+                    await self.chromadb.add_document(
+                        collection_base="atoms",
+                        doc_id=atom["id"],
+                        text=f"{atom['name']}: {atom.get('category', 'general')} function. "
+                             f"Tags: {', '.join(atom.get('semantic_tags', []))}",
+                        metadata={
+                            "name": atom["name"],
+                            "category": atom.get("category", "general"),
+                            "line_count": atom.get("line_count", 0),
+                            "structural_fp": atom.get("structural_fp", ""),
+                        }
+                    )
+
+        elif content_type == "TEXT":
+            summary = result.get("summary", "")
+            if summary and summary != "Summary unavailable":
+                await self.chromadb.add_document(
+                    collection_base="sessions",
+                    doc_id=queue_id,
+                    text=summary,
+                    metadata={
+                        "content_type": content_type,
+                        "has_entities": bool(result.get("entities")),
+                        "has_decisions": bool(result.get("decisions")),
+                    }
+                )
+
+    # ============================================================
+    # Queue Management
+    # ============================================================
+
+    def _mark_complete(self, queue_id: str, result: Dict[str, Any]):
+        """Mark queue item as completed."""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE queue SET status = 'completed', completed_at = datetime('now'),
+                    meta = ?
+                WHERE id = ?
+            """, (json.dumps({"result": {k: v for k, v in result.items() if k != "atoms"}}), queue_id))
+            conn.commit()
+
+    def _mark_failed(self, queue_id: str, error: str):
+        """Mark queue item as failed."""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE queue SET status = 'failed', error = ?,
+                    completed_at = datetime('now')
+                WHERE id = ?
+            """, (error[:1000], queue_id))
+            conn.commit()
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get worker statistics."""
+        return {
+            "running": self._running,
+            "processed": self._processed_count,
+            "errors": self._error_count,
+            "poll_interval": POLL_INTERVAL,
+            "batch_size": BATCH_SIZE,
+        }
+
+
+# Global worker instance
+worker = MitochondriaWorker()
+
+
+def get_worker() -> MitochondriaWorker:
+    """Get worker instance"""
+    return worker

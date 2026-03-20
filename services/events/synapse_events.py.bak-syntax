@@ -1,0 +1,106 @@
+"""Synapse Event Handlers — synapse.completed subscriber
+
+Fired when:
+- inject_context assembles and returns context (the synapse "fired")
+- end_session closes a session
+
+Subscribers:
+- token_tracker: record token usage estimate
+- session_logger: ensure session is recorded for future retrieval
+"""
+import logging
+from typing import Any, Dict
+
+log = logging.getLogger("helix.events.synapse")
+
+
+async def handle_synapse_completed(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle synapse.completed event.
+
+    Payload keys:
+      session_id, query (if context_injected), summary/outcome (if session_ended),
+      atoms_found, event (context_injected | session_ended).
+    """
+    session_id = payload.get("session_id", "")
+    event_kind = payload.get("event", "unknown")
+
+    log.debug(f"synapse.completed: {event_kind} for session {session_id}")
+
+    results = {}
+
+    # --- Session logger ---
+    # Ensure a session record exists for this session_id.
+    if session_id:
+        try:
+            from services.database import get_db
+            db = get_db()
+            with db.get_connection() as conn:
+                existing = conn.execute(
+                    "SELECT id FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if not existing:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO sessions (id, provider, model, significance, meta)
+                           VALUES (?, 'claude', 'unknown', 0, '{}')""",
+                        (session_id,)
+                    )
+                    conn.commit()
+                    results["session_logger"] = {"status": "created", "session_id": session_id}
+                else:
+                    results["session_logger"] = {"status": "exists"}
+        except Exception as e:
+            log.debug(f"synapse session_logger failed (non-fatal): {e}")
+            results["session_logger"] = {"status": "skipped", "reason": str(e)}
+
+    # --- Token tracker ---
+    # Estimate cumulative token usage for this session from exchange records.
+    if session_id:
+        try:
+            from services.database import get_db
+            from services.meta import get_meta_service
+            db = get_db()
+            with db.get_connection() as conn:
+                row = conn.execute(
+                    """SELECT COUNT(*), SUM(tool_calls), SUM(LENGTH(what_happened)),
+                              SUM(LENGTH(decision)), SUM(LENGTH(notes))
+                       FROM exchanges WHERE session_id = ? AND skip = 0""",
+                    (session_id,)
+                ).fetchone()
+
+            if row and row[0]:
+                exchange_count = row[0] or 0
+                total_tool_calls = row[1] or 0
+                total_chars = (row[2] or 0) + (row[3] or 0) + (row[4] or 0)
+                # Rough estimate: 4 chars ~ 1 token; tool calls ~150 tokens each
+                estimated_tokens = (total_chars // 4) + (total_tool_calls * 150)
+
+                meta_svc = get_meta_service()
+                try:
+                    meta_svc.write_meta("sessions", session_id, "token_usage", {
+                        "exchange_count": exchange_count,
+                        "tool_calls": total_tool_calls,
+                        "estimated_tokens": estimated_tokens,
+                        "event_kind": event_kind,
+                    }, written_by="synapse_events.token_tracker_v1")
+                    results["token_tracker"] = {
+                        "status": "ok",
+                        "estimated_tokens": estimated_tokens,
+                        "exchange_count": exchange_count,
+                    }
+                except Exception as _me:
+                    # Session may not exist in sessions table; non-fatal
+                    results["token_tracker"] = {"status": "skipped", "reason": str(_me)}
+            else:
+                results["token_tracker"] = {"status": "ok", "no_exchanges": True}
+        except Exception as e:
+            log.debug(f"token_tracker failed (non-fatal): {e}")
+            results["token_tracker"] = {"status": "skipped", "reason": str(e)}
+    else:
+        results["token_tracker"] = {"status": "skipped", "reason": "no session_id"}
+
+    return {
+        "event": "synapse.completed",
+        "session_id": session_id,
+        "event_kind": event_kind,
+        "results": results,
+    }

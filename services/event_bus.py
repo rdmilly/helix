@@ -1,0 +1,153 @@
+"""Event Bus — Universal publish/subscribe for Helix intelligence.
+
+Every node that produces information publishes an event.
+Consumers (worker handlers) subscribe independently.
+
+The bus IS the queue table — publishing an event = inserting a queue row.
+The worker polls the queue and dispatches to registered event handlers.
+
+Event types (dot-separated, distinguishable from intake_types by the dot):
+  file.written     — helix_file_write completed
+  file.read        — helix_file_read completed
+  synapse.completed — context/inject returned a result
+  exchange.posted  — helix_exchange_post called
+  session.ingested — ext_ingest flush completed
+  entity.upserted  — KG entity created/updated
+  pattern.detected — scanner found a new atom
+  archive.recorded — decision/failure/pattern stored
+
+Publishing:
+  from services.event_bus import publish
+  event_id = publish('file.written', {'path': ..., 'content': ..., 'steps': {...}})
+
+The publish() function is sync — works from both sync and async callers.
+
+Fan-out is handled by the worker: a single 'file.written' queue item triggers
+all registered subscribers in sequence. True parallel fan-out (multiple queue
+rows per event) can be added later without changing publishers.
+"""
+import json
+import logging
+import os
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+log = logging.getLogger("helix.event_bus")
+
+DB_PATH = os.environ.get("DB_PATH", "/app/data/cortex.db")
+
+# Event priority levels
+PRIORITY_HIGH = 10
+PRIORITY_NORMAL = 5
+PRIORITY_LOW = 1
+
+# Default priorities by event type
+EVENT_PRIORITIES = {
+    "file.written": PRIORITY_NORMAL,
+    "file.read": PRIORITY_LOW,
+    "synapse.completed": PRIORITY_LOW,
+    "exchange.posted": PRIORITY_NORMAL,
+    "session.ingested": PRIORITY_NORMAL,
+    "entity.upserted": PRIORITY_LOW,
+    "pattern.detected": PRIORITY_LOW,
+    "archive.recorded": PRIORITY_LOW,
+    "turn.flush":       PRIORITY_HIGH,
+}
+
+
+def publish(
+    event_type: str,
+    payload: Dict[str, Any],
+    priority: Optional[int] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """Publish an event to the queue.
+
+    Inserts a row into the queue table with intake_type = event_type.
+    The worker picks it up and dispatches to the appropriate handler.
+
+    Args:
+        event_type: Dot-separated event name (e.g. 'file.written')
+        payload: Event data dict. Serialized to JSON in the queue.
+        priority: Queue priority (default: from EVENT_PRIORITIES or PRIORITY_NORMAL)
+        session_id: Optional session context (stored in payload)
+
+    Returns:
+        Queue item ID (evt_<12hex>)
+    """
+    event_id = f"evt_{uuid.uuid4().hex[:12]}"
+
+    if priority is None:
+        priority = EVENT_PRIORITIES.get(event_type, PRIORITY_NORMAL)
+
+    # Inject standard event metadata
+    full_payload = {
+        "event_type": event_type,
+        "event_id": event_id,
+        "published_at": datetime.now(timezone.utc).isoformat(),
+        **payload,
+    }
+    if session_id and "session_id" not in full_payload:
+        full_payload["session_id"] = session_id
+
+    try:
+        from services import pg_sync
+        with pg_sync.get_pg_conn() as conn:
+            conn.execute(
+                """INSERT INTO queue (id, intake_type, payload, status, priority)
+                   VALUES (?, ?, ?, 'pending', ?)""",
+                (event_id, event_type, json.dumps(full_payload), priority)
+            )
+            conn.commit()
+        log.debug(f"Published {event_type} → {event_id}")
+    except Exception as e:
+        log.error(f"Event publish failed ({event_type}): {e}")
+        # Non-fatal: don't block the caller
+
+    return event_id
+
+
+def is_event(intake_type: str) -> bool:
+    """Return True if this intake_type is an event (contains a dot).
+
+    Events use dot-separated names like 'file.written'.
+    Regular intake types use underscores like 'exchange', 'summary'.
+    """
+    return "." in intake_type
+
+
+def register_event_types(db_path: Optional[str] = None) -> None:
+    """Register all event types in type_registry.
+
+    Called once at startup. Idempotent — safe to call multiple times.
+    """
+    path = db_path or DB_PATH
+    events = [
+        ("file.written",      "event", "services.worker.handle_file_written",   "event_bus_v1"),
+        ("file.read",         "event", "services.worker.handle_file_read",      "event_bus_v1"),
+        ("synapse.completed", "event", "services.worker.handle_synapse_done",   "event_bus_v1"),
+        ("exchange.posted",   "event", "services.worker.handle_exchange_posted","event_bus_v1"),
+        ("session.ingested",  "event", "services.worker.handle_session_ingested","event_bus_v1"),
+        ("entity.upserted",   "event", "services.worker.handle_entity_upserted","event_bus_v1"),
+        ("pattern.detected",  "event", "services.worker.handle_pattern_detected","event_bus_v1"),
+        ("archive.recorded",  "event", "services.worker.handle_archive_recorded","event_bus_v1"),
+        ("turn.flush",         "event", "services.events.turn_events.handle_turn_flush",  "event_bus_v1"),
+    ]
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            for type_name, category, handler, registered_by in events:
+                conn.execute(
+                    """INSERT INTO type_registry
+                       (type_name, category, handler, registered_by, active)
+                       VALUES (?, ?, ?, ?, 1) ON CONFLICT DO NOTHING""",
+                    (type_name, category, handler, registered_by)
+                )
+            conn.commit()
+            log.info(f"Registered {len(events)} event types in type_registry")
+        finally:
+            conn.close()
+    except Exception as e:
+        log.error(f"Event type registration failed: {e}")

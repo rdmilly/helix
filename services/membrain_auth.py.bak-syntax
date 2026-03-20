@@ -1,0 +1,235 @@
+from services import pg_sync
+"""
+MemBrain Auth Service
+Manages per-user API tokens for the paid vector tier.
+
+Token format: mbr_{user_id}_{32 random hex chars}
+Storage:      SHA-256 hash of token stored in membrain_users table
+              in the existing cortex.db SQLite database.
+
+Tables added to cortex.db:
+    membrain_users  -- one row per paying user
+    membrain_events -- audit log (provision, revoke, search, migrate)
+
+Usage:
+    from services.membrain_auth import membrain_auth
+    user = await membrain_auth.verify_token(token)
+    if not user: raise HTTPException(401)
+
+    token, user_id = await membrain_auth.provision_user(email="x@y.com")
+"""
+import hashlib
+import logging
+import os
+import secrets
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+from services.database import get_db_path
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MembrainUser:
+    id: str              # e.g. "usr_abc123def456"
+    email: str
+    tier: str            # "paid" | "admin"
+    collection_name: str # e.g. "membrain_usr_abc123def456"
+    revoked: bool
+
+
+class MembrainAuthService:
+    """
+    Manages MemBrain user tokens.
+
+    Thread-safe: uses a new sqlite3 connection per operation
+    (same pattern as the rest of cortex).
+    """
+
+    def __init__(self):
+        self._db_path = get_db_path()
+        self._ensure_schema()
+
+    # ==================== PUBLIC API ====================
+
+    async def verify_token(self, raw_token: str) -> Optional[MembrainUser]:
+        """
+        Verify a raw Bearer token.
+        Returns MembrainUser if valid and not revoked, None otherwise.
+        Runs synchronously (SQLite is fast enough; no async driver needed).
+        """
+        if not raw_token or not raw_token.startswith("mbr_"):
+            return None
+
+        token_hash = self._hash(raw_token)
+
+        import sqlite3
+        try:
+            conn = pg_sync.sqlite_conn(self._db_path)
+            row = conn.execute(
+                """
+                SELECT id, email, tier, collection_name, revoked
+                FROM membrain_users
+                WHERE token_hash = ? AND revoked = 0
+                """,
+                (token_hash,),
+            ).fetchone()
+            conn.close()
+
+            if not row:
+                return None
+
+            return MembrainUser(
+                id=row["id"],
+                email=row["email"],
+                tier=row["tier"],
+                collection_name=row["collection_name"],
+                revoked=bool(row["revoked"]),
+            )
+        except Exception as e:
+            logger.error(f"[MembrainAuth] Token verification failed: {e}")
+            return None
+
+    def provision_user(self, email: str, tier: str = "paid") -> Tuple[str, str]:
+        """
+        Create a new user record and generate a token.
+
+        Returns (raw_token, user_id).
+        The raw_token is shown ONCE — it's not stored in plain text.
+
+        Safe to call multiple times for the same email — returns a new
+        token each time (old tokens remain valid until revoked).
+        """
+        user_id = f"usr_{secrets.token_hex(8)}"
+        raw_token = f"mbr_{user_id}_{secrets.token_hex(16)}"
+        token_hash = self._hash(raw_token)
+        collection_name = f"membrain_{user_id}"
+
+        import sqlite3
+        conn = pg_sync.sqlite_conn(self._db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO membrain_users
+                    (id, token_hash, email, tier, collection_name, revoked)
+                VALUES (?, ?, ?, ?, ?, 0)
+                """,
+                (user_id, token_hash, email, tier, collection_name),
+            )
+            conn.commit()
+            logger.info(f"[MembrainAuth] Provisioned user {user_id} ({email}, {tier})")
+        finally:
+            conn.close()
+
+        self._log_event(user_id, "provision", {"email": email, "tier": tier})
+        return raw_token, user_id
+
+    def revoke_user(self, user_id: str) -> bool:
+        """Revoke all tokens for a user."""
+        import sqlite3
+        conn = pg_sync.sqlite_conn(self._db_path)
+        try:
+            conn.execute(
+                "UPDATE membrain_users SET revoked = 1 WHERE id = ?",
+                (user_id,),
+            )
+            conn.commit()
+            logger.info(f"[MembrainAuth] Revoked user {user_id}")
+            self._log_event(user_id, "revoke", {})
+            return True
+        except Exception as e:
+            logger.error(f"[MembrainAuth] Revoke failed: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def list_users(self) -> list:
+        """List all users (for admin endpoint)."""
+        import sqlite3
+        conn = pg_sync.sqlite_conn(self._db_path)
+        try:
+            rows = conn.execute(
+                "SELECT id, email, tier, collection_name, revoked, created_at FROM membrain_users ORDER BY created_at DESC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def get_user_stats(self, user_id: str) -> dict:
+        """Get usage stats for a user."""
+        import sqlite3
+        conn = pg_sync.sqlite_conn(self._db_path)
+        try:
+            events = conn.execute(
+                "SELECT event_type, COUNT(*) as cnt FROM membrain_events WHERE user_id = ? GROUP BY event_type",
+                (user_id,),
+            ).fetchall()
+            return {r["event_type"]: r["cnt"] for r in events}
+        finally:
+            conn.close()
+
+    # ==================== PRIVATE ====================
+
+    def _hash(self, token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def _log_event(self, user_id: str, event_type: str, meta: dict):
+        """Write an audit log entry."""
+        import sqlite3, json
+        conn = pg_sync.sqlite_conn(self._db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO membrain_events (user_id, event_type, meta)
+                VALUES (?, ?, ?)
+                """,
+                (user_id, event_type, json.dumps(meta)),
+            )
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"[MembrainAuth] Event log failed: {e}")
+        finally:
+            conn.close()
+
+    def _ensure_schema(self):
+        """Create tables if they don't exist. Safe to call multiple times."""
+        import sqlite3
+        conn = pg_sync.sqlite_conn(self._db_path)
+        try:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS membrain_users (
+                    id               TEXT PRIMARY KEY,
+                    token_hash       TEXT UNIQUE NOT NULL,
+                    email            TEXT NOT NULL DEFAULT '',
+                    tier             TEXT NOT NULL DEFAULT 'paid',
+                    collection_name  TEXT NOT NULL,
+                    revoked          INTEGER NOT NULL DEFAULT 0,
+                    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+                    meta             TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_membrain_users_token
+                    ON membrain_users (token_hash);
+
+                CREATE TABLE IF NOT EXISTS membrain_events (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id    TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    meta       TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_membrain_events_user
+                    ON membrain_events (user_id, event_type);
+            """)
+            conn.commit()
+            logger.debug("[MembrainAuth] Schema ready")
+        except Exception as e:
+            logger.error(f"[MembrainAuth] Schema init failed: {e}")
+        finally:
+            conn.close()
+
+
+# Singleton
+membrain_auth = MembrainAuthService()

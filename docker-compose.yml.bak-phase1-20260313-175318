@@ -1,0 +1,61 @@
+services:
+  helix-cortex:
+    build: .
+    container_name: helix-cortex
+    restart: unless-stopped
+    ports:
+      - "9050:9050"
+    volumes:
+      - ./data:/app/data
+      - /opt/projects:/opt/projects
+      - /opt/data/working-kb:/app/working-kb:rw
+    env_file:
+      - .env
+    networks:
+      - coolify
+      - helix
+      - shared
+      - mcp-network
+    depends_on:
+      helix-chromadb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9050/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=coolify"
+      - "traefik.http.routers.helix.rule=Host(`helix.millyweb.com`)"
+      - "traefik.http.routers.helix.entrypoints=https"
+      - "traefik.http.routers.helix.tls.certresolver=letsencrypt"
+      - "traefik.http.services.helix.loadbalancer.server.port=9050"
+
+  helix-chromadb:
+    image: chromadb/chroma:0.5.23
+    container_name: helix-chromadb
+    restart: unless-stopped
+    volumes:
+      - ./chromadb-data:/chroma/chroma
+    environment:
+      - ANONYMIZED_TELEMETRY=False
+    networks:
+      - helix
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8000"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+networks:
+  coolify:
+    external: true
+  helix:
+    name: helix
+  shared:
+    external: true
+  mcp-network:
+    external: true

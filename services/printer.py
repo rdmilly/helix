@@ -1,0 +1,885 @@
+"""The Printer v2 — Mechanical Expression Engine
+
+Converts semantic concepts into working code WITHOUT LLM calls.
+Spend tokens ONCE at capture, stamp out forever at zero cost.
+
+v2 fixes:
+  - Parameter placeholders use NAME (unique) not ROLE (can collide)
+  - Proper handling of duplicate roles (missing_key_status vs invalid_key_status)
+  - Code-expression defaults tracked but not naively replaced
+  - Hash-based expression IDs prevent collisions
+  - Skeleton versioning for re-extraction
+  - Cross-language synthesis: Haiku generates skeleton for new frameworks (once)
+  - Polish endpoint: cheap LLM cleanup pass on mechanical output
+"""
+import json
+from services import pg_sync
+import re
+import logging
+import sqlite3
+import hashlib
+from typing import Dict, Any, Optional, List, Tuple
+from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# Expression Table Schema v2
+# ============================================================
+
+EXPRESSION_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS expressions (
+    id TEXT PRIMARY KEY,
+    archetype TEXT NOT NULL,
+    framework TEXT NOT NULL,
+    section TEXT NOT NULL DEFAULT 'utility',
+    skeleton TEXT NOT NULL,
+    parameter_map TEXT DEFAULT '{}',
+    structural_params TEXT DEFAULT '[]',
+    observed_from TEXT DEFAULT '[]',
+    observed_count INTEGER DEFAULT 1,
+    confidence REAL DEFAULT 0.5,
+    generated_by TEXT DEFAULT 'extracted',
+    skeleton_version INTEGER DEFAULT 1,
+    meta TEXT DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(archetype, framework, section)
+);
+
+CREATE INDEX IF NOT EXISTS idx_expressions_lookup 
+    ON expressions(archetype, framework);
+CREATE INDEX IF NOT EXISTS idx_expressions_archetype 
+    ON expressions(archetype);
+"""
+
+
+def _expr_id(archetype: str, framework: str, section: str) -> str:
+    """Deterministic hash-based ID from archetype × framework × section."""
+    raw = f"{archetype}:{framework}:{section}"
+    return "expr_" + hashlib.sha256(raw.encode()).hexdigest()[:12]
+
+
+class ExpressionTable:
+    """Stores archetype × framework → skeleton mappings.
+    
+    Each row was paid for once (at capture or synthesis). Each lookup is free.
+    """
+    
+    def __init__(self, db_path: str = "/app/data/cortex.db"):
+        self.db_path = db_path
+        self._ensure_table()
+    
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def _ensure_table(self):
+        conn = self._get_conn()
+        try:
+            pass  # schema already in PostgreSQL
+            # Add columns if missing (upgrade path from v1)
+            for col, default in [
+                ("structural_params", "'[]'"),
+                ("generated_by", "'extracted'"),
+                ("skeleton_version", "1"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE expressions ADD COLUMN {col} TEXT DEFAULT {default}")
+                except:
+                    pass  # Column already exists
+            conn.commit()
+        finally:
+            conn.close()
+    
+    def register(self, archetype: str, framework: str, section: str,
+                 skeleton: str, parameter_map: Dict[str, str],
+                 structural_params: List[Dict],
+                 source_atom_id: str,
+                 generated_by: str = "extracted") -> Dict[str, Any]:
+        """Register or update an expression skeleton."""
+        expr_id = _expr_id(archetype, framework, section)
+        conn = self._get_conn()
+        try:
+            existing = conn.execute(
+                "SELECT id, observed_from, observed_count, confidence, skeleton_version "
+                "FROM expressions WHERE id = ?", (expr_id,)
+            ).fetchone()
+            
+            if existing:
+                sources = pg_sync.dejson(existing["observed_from"])
+                if source_atom_id not in sources:
+                    sources.append(source_atom_id)
+                count = existing["observed_count"] + 1
+                confidence = 1.0 - (0.5 ** count)
+                version = existing["skeleton_version"] + 1
+                
+                conn.execute("""
+                    UPDATE expressions 
+                    SET skeleton = ?, parameter_map = ?, structural_params = ?,
+                        observed_from = ?, observed_count = ?, confidence = ?,
+                        skeleton_version = ?, generated_by = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (skeleton, json.dumps(parameter_map),
+                      json.dumps(structural_params),
+                      json.dumps(sources), count, confidence,
+                      version, generated_by, expr_id))
+                conn.commit()
+                return {
+                    "status": "updated", "id": expr_id,
+                    "observed_count": count, "confidence": round(confidence, 3),
+                    "skeleton_version": version,
+                }
+            else:
+                conn.execute("""
+                    INSERT INTO expressions 
+                    (id, archetype, framework, section, skeleton, parameter_map,
+                     structural_params, observed_from, observed_count, confidence,
+                     generated_by, skeleton_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0.5, ?, 1) ON CONFLICT DO NOTHING
+                """, (expr_id, archetype, framework, section, skeleton,
+                      json.dumps(parameter_map), json.dumps(structural_params),
+                      json.dumps([source_atom_id]), generated_by))
+                conn.commit()
+                return {"status": "registered", "id": expr_id, "confidence": 0.5,
+                        "skeleton_version": 1}
+        finally:
+            conn.close()
+    
+    def lookup(self, archetype: str, framework: str,
+               section: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Look up expression skeleton for archetype × framework."""
+        conn = self._get_conn()
+        try:
+            if section:
+                row = conn.execute(
+                    "SELECT * FROM expressions WHERE archetype = ? "
+                    "AND framework = ? AND section = ?",
+                    (archetype, framework, section)
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM expressions WHERE archetype = ? AND framework = ? "
+                    "ORDER BY confidence DESC LIMIT 1",
+                    (archetype, framework)
+                ).fetchone()
+            
+            if not row:
+                return None
+            return {
+                "id": row["id"], "archetype": row["archetype"],
+                "framework": row["framework"], "section": row["section"],
+                "skeleton": row["skeleton"],
+                "parameter_map": pg_sync.dejson(row["parameter_map"]),
+                "structural_params": pg_sync.dejson(row["structural_params"] or "[]"),
+                "observed_count": row["observed_count"],
+                "confidence": row["confidence"],
+                "generated_by": row["generated_by"] or "extracted",
+                "skeleton_version": row["skeleton_version"] or 1,
+            }
+        finally:
+            conn.close()
+    
+    def lookup_all_sections(self, archetype: str, framework: str) -> List[Dict[str, Any]]:
+        """Get all section skeletons for an archetype × framework."""
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM expressions WHERE archetype = ? AND framework = ?",
+                (archetype, framework)
+            ).fetchall()
+            return [{
+                "id": r["id"], "section": r["section"],
+                "skeleton": r["skeleton"],
+                "parameter_map": pg_sync.dejson(r["parameter_map"]),
+                "confidence": r["confidence"],
+            } for r in rows]
+        finally:
+            conn.close()
+    
+    def list_frameworks(self, archetype: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List known frameworks, optionally filtered by archetype."""
+        conn = self._get_conn()
+        try:
+            if archetype:
+                rows = conn.execute("""
+                    SELECT framework, COUNT(*) as expressions,
+                           AVG(confidence) as avg_confidence,
+                           SUM(observed_count) as total_observations
+                    FROM expressions WHERE archetype = ?
+                    GROUP BY framework ORDER BY total_observations DESC
+                """, (archetype,)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT framework, COUNT(*) as expressions,
+                           COUNT(DISTINCT archetype) as archetypes,
+                           AVG(confidence) as avg_confidence,
+                           SUM(observed_count) as total_observations
+                    FROM expressions
+                    GROUP BY framework ORDER BY total_observations DESC
+                """).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+    
+    def coverage_report(self) -> Dict[str, Any]:
+        """Report on expression table coverage."""
+        conn = self._get_conn()
+        try:
+            total = conn.execute("SELECT COUNT(*) FROM expressions").fetchone()[0]
+            archetypes = conn.execute(
+                "SELECT COUNT(DISTINCT archetype) FROM expressions"
+            ).fetchone()[0]
+            frameworks = conn.execute(
+                "SELECT COUNT(DISTINCT framework) FROM expressions"
+            ).fetchone()[0]
+            high_conf = conn.execute(
+                "SELECT COUNT(*) FROM expressions WHERE confidence >= 0.75"
+            ).fetchone()[0]
+            synthesized = conn.execute(
+                "SELECT COUNT(*) FROM expressions WHERE generated_by = 'synthesized'"
+            ).fetchone()[0]
+            
+            matrix = conn.execute("""
+                SELECT archetype, framework, section, confidence, 
+                       observed_count, generated_by, skeleton_version
+                FROM expressions ORDER BY archetype, framework, section
+            """).fetchall()
+            
+            return {
+                "total_expressions": total,
+                "unique_archetypes": archetypes,
+                "unique_frameworks": frameworks,
+                "high_confidence": high_conf,
+                "synthesized": synthesized,
+                "matrix": [dict(r) for r in matrix],
+            }
+        finally:
+            conn.close()
+    
+    def clear(self):
+        """Drop all expressions. Used before re-learning with new algorithm."""
+        conn = self._get_conn()
+        try:
+            conn.execute("DELETE FROM expressions")
+            conn.commit()
+        finally:
+            conn.close()
+
+
+class SkeletonExtractor:
+    """v2: Converts observed code + concept metadata into a generic skeleton.
+    
+    Key fix: Uses parameter NAME (unique) as placeholder, not ROLE (can collide).
+    
+    Returns (skeleton, parameter_map, structural_params) where:
+      - skeleton has {{param_name}} placeholders
+      - parameter_map: {param_name: default_value} for replaceable params
+      - structural_params: [{name, role, default, reason}] for params that
+        couldn't be mechanically replaced (code expressions, etc.)
+    """
+    
+    @staticmethod
+    def extract(code: str, concept: Dict[str, Any],
+                composition: Dict[str, Any]) -> Tuple[str, Dict[str, str], List[Dict]]:
+        """Extract skeleton from observed code using concept parameters.
+        
+        Returns (skeleton, parameter_map, structural_params).
+        """
+        skeleton = code
+        parameter_map = {}
+        structural_params = []
+        
+        params = composition.get("parameters", [])
+        
+        # Sort by default value length descending to replace longer strings first,
+        # preventing partial matches
+        params_sorted = sorted(
+            params,
+            key=lambda p: len(str(p.get("default", ""))),
+            reverse=True
+        )
+        
+        for param in params_sorted:
+            name = param.get("name", "")
+            default_val = param.get("default")
+            role = param.get("semantic_role", "unknown")
+            
+            if not name or default_val is None:
+                continue
+            
+            default_str = str(default_val).strip()
+            if not default_str or default_str in ("None", "required parameter"):
+                continue
+            
+            # Use NAME as placeholder (unique per concept)
+            placeholder = "{{" + name + "}}"
+            
+            replaced = False
+            
+            # Strategy 1: Try quoted string replacement (most reliable)
+            for quote in ['"', "'"]:
+                quoted = f"{quote}{default_str}{quote}"
+                if quoted in skeleton:
+                    # Replace only first occurrence to handle params with same value
+                    skeleton = skeleton.replace(quoted, f"{quote}{placeholder}{quote}", 1)
+                    parameter_map[name] = default_str
+                    replaced = True
+                    break
+            
+            if replaced:
+                continue
+            
+            # Strategy 2: Try unquoted replacement for numbers and booleans
+            if default_str.isdigit() or default_str in ("True", "False", "true", "false"):
+                pattern = r'(?<![a-zA-Z_])' + re.escape(default_str) + r'(?![a-zA-Z_0-9])'
+                match = re.search(pattern, skeleton)
+                if match:
+                    skeleton = skeleton[:match.start()] + placeholder + skeleton[match.end():]
+                    parameter_map[name] = default_str
+                    replaced = True
+            
+            if replaced:
+                continue
+            
+            # Strategy 3: Try unquoted variable/expression (e.g., VALID_KEYS)
+            if re.match(r'^[A-Z_][A-Z_0-9]+$', default_str):
+                # ALL_CAPS variable name — likely a constant reference
+                pattern = r'\b' + re.escape(default_str) + r'\b'
+                match = re.search(pattern, skeleton)
+                if match:
+                    skeleton = skeleton[:match.start()] + placeholder + skeleton[match.end():]
+                    parameter_map[name] = default_str
+                    replaced = True
+            
+            if not replaced:
+                # This param is structural — can't be mechanically replaced
+                # (code expressions like request.client.host, complex defaults, etc.)
+                structural_params.append({
+                    "name": name,
+                    "semantic_role": role,
+                    "default": default_str,
+                    "reason": "code_expression" if '.' in default_str or '(' in default_str 
+                              else "not_found_in_source",
+                })
+        
+        return skeleton, parameter_map, structural_params
+    
+    @staticmethod
+    def detect_framework(code: str, structural: Dict[str, Any]) -> str:
+        """Detect framework from code and structural metadata."""
+        language = structural.get("language", "unknown")
+        code_lower = code.lower()
+        
+        framework_signals = {
+            "python": [
+                ("fastapi", "python-fastapi"),
+                ("from flask", "python-flask"),
+                ("django", "python-django"),
+                ("sqlalchemy", "python-sqlalchemy"),
+                ("pydantic", "python-pydantic"),
+                ("httpx", "python-httpx"),
+                ("aiohttp", "python-aiohttp"),
+            ],
+            "javascript": [
+                ("express", "node-express"),
+                ("next", "node-nextjs"),
+                ("react", "react"),
+                ("vue", "vue"),
+                ("koa", "node-koa"),
+            ],
+            "typescript": [
+                ("express", "ts-express"),
+                ("next", "ts-nextjs"),
+                ("nest", "ts-nestjs"),
+            ],
+            "go": [
+                ("gin.", "go-gin"),
+                ("echo.", "go-echo"),
+                ("fiber.", "go-fiber"),
+                ("net/http", "go-stdlib"),
+                ("chi.", "go-chi"),
+            ],
+            "rust": [
+                ("actix", "rust-actix"),
+                ("axum", "rust-axum"),
+                ("rocket", "rust-rocket"),
+            ],
+        }
+        
+        # Check framework-specific signals
+        if language in framework_signals:
+            for signal, framework in framework_signals[language]:
+                if signal in code_lower:
+                    return framework
+        
+        # Language-level fallback
+        if language == "python":
+            if structural.get("is_async"):
+                return "python-async"
+            return "python"
+        elif language in ("dockerfile", "docker-compose", "yaml", "toml", "json"):
+            return language
+        elif language:
+            return language
+        
+        return "unknown"
+
+
+class MechanicalPrinter:
+    """The Printer v2 — stamps out code from concepts. Zero LLM tokens.
+    
+    Flow:
+      1. Read concept metadata (archetype, parameters, section)
+      2. Look up skeleton in expression table (archetype × framework)
+      3. Fill parameter placeholders from concept metadata
+      4. If no skeleton exists, optionally synthesize one via Haiku (once)
+      5. Optional polish pass cleans up the ~20% that's rough (cheap)
+    """
+    
+    def __init__(self, db_path: str = "/app/data/cortex.db"):
+        self.db_path = db_path
+        self.expression_table = ExpressionTable(db_path)
+    
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    async def _call_haiku(self, prompt: str, max_tokens: int = 1024) -> Optional[str]:
+        """Direct Haiku API call for synthesis/polish."""
+        import os, httpx
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            logger.error("ANTHROPIC_API_KEY not set")
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": max_tokens,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                )
+            if response.status_code != 200:
+                logger.error(f"Haiku API error: {response.status_code}")
+                return None
+            data = response.json()
+            text = data["content"][0]["text"].strip()
+            # Strip markdown fences
+            if text.startswith("```"):
+                lines = text.split("\n")
+                text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+            return text
+        except Exception as e:
+            logger.error(f"Haiku call failed: {e}")
+            return None
+    
+    async def print_concept(self, atom_id: str, target_framework: str,
+                      param_overrides: Optional[Dict[str, str]] = None,
+                      synthesize: bool = False
+                      ) -> Dict[str, Any]:
+        """Print a single concept as code in the target framework.
+        
+        Args:
+            synthesize: If True and no skeleton exists, use Haiku ONCE to
+                       generate one for this archetype × framework. Costs
+                       ~$0.003 but future prints are free.
+        """
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT id, name, code, meta FROM atoms WHERE id = ?", (atom_id,)
+            ).fetchone()
+            if not row:
+                return {"error": f"Atom {atom_id} not found"}
+            
+            meta = pg_sync.dejson(row["meta"] or "{}")
+            concept = meta.get("concept", {})
+            composition = meta.get("composition", {})
+            archetype = concept.get("archetype", "utility")
+            section = composition.get("primary_section", "utility")
+            understanding = concept.get("understanding", {})
+            
+            # Step 1: Try mechanical expression
+            expression = self.expression_table.lookup(
+                archetype, target_framework, section
+            )
+            
+            if expression:
+                output = self._fill_skeleton(
+                    expression["skeleton"],
+                    expression["parameter_map"],
+                    composition.get("parameters", []),
+                    param_overrides or {}
+                )
+                return {
+                    "atom_id": atom_id, "name": row["name"],
+                    "output": output, "section": section,
+                    "method": "mechanical",
+                    "framework": target_framework,
+                    "confidence": expression["confidence"],
+                    "observed_count": expression["observed_count"],
+                    "generated_by": expression["generated_by"],
+                    "structural_params": expression.get("structural_params", []),
+                    "tokens_saved": self._estimate_tokens(output),
+                }
+            
+            # Step 2: Synthesize if requested and no skeleton exists
+            if synthesize:
+                synth_result = await self._synthesize_skeleton(
+                    archetype, target_framework, section,
+                    concept, composition, understanding, atom_id
+                )
+                if synth_result and "skeleton" in synth_result:
+                    output = self._fill_skeleton(
+                        synth_result["skeleton"],
+                        synth_result.get("parameter_map", {}),
+                        composition.get("parameters", []),
+                        param_overrides or {}
+                    )
+                    return {
+                        "atom_id": atom_id, "name": row["name"],
+                        "output": output, "section": section,
+                        "method": "synthesized",
+                        "framework": target_framework,
+                        "confidence": 0.4,  # lower initial confidence for synthesis
+                        "observed_count": 0,
+                        "generated_by": "synthesized",
+                        "synthesis_note": "Generated via Haiku. First print in this framework. Future prints are free.",
+                        "tokens_saved": self._estimate_tokens(output),
+                    }
+            
+            # Step 3: Fallback to raw code
+            return {
+                "atom_id": atom_id, "name": row["name"],
+                "output": row["code"], "section": section,
+                "method": "fallback_raw",
+                "framework": "original",
+                "confidence": 0.0,
+                "observed_count": 0,
+                "generated_by": "none",
+                "tokens_saved": 0,
+                "note": f"No expression for {archetype} × {target_framework}. "
+                        f"Use synthesize=true to generate one via Haiku (~$0.003, one-time).",
+            }
+        finally:
+            conn.close()
+    
+    async def print_assembly(self, atom_ids: List[str], target_framework: str,
+                       param_overrides: Optional[Dict[str, Dict[str, str]]] = None,
+                       synthesize: bool = False
+                       ) -> Dict[str, Any]:
+        """Print and assemble multiple concepts."""
+        from services.assembler import SectionMerger
+        
+        merger = SectionMerger()
+        results = []
+        total_tokens_saved = 0
+        methods_used = set()
+        
+        for atom_id in atom_ids:
+            overrides = (param_overrides or {}).get(atom_id, {})
+            result = await self.print_concept(
+                atom_id, target_framework, overrides, synthesize=synthesize
+            )
+            
+            if "error" in result:
+                results.append(result)
+                continue
+            
+            merger.add_atom(
+                atom_id=atom_id, name=result["name"],
+                code=result["output"], section=result["section"],
+            )
+            
+            total_tokens_saved += result.get("tokens_saved", 0)
+            methods_used.add(result["method"])
+            results.append(result)
+        
+        output = merger.get_full_output()
+        sections = merger.get_merged()
+        
+        mechanical_count = sum(
+            1 for r in results if r.get("method") in ("mechanical", "synthesized")
+        )
+        
+        return {
+            "output": output,
+            "sections": sections,
+            "framework": target_framework,
+            "atoms_printed": len(results),
+            "methods_used": list(methods_used),
+            "total_tokens_saved": total_tokens_saved,
+            "mechanical_rate": mechanical_count / max(len(results), 1),
+            "per_atom": results,
+        }
+    
+    def learn_expression(self, atom_id: str) -> Dict[str, Any]:
+        """Learn an expression skeleton from an enriched atom.
+        
+        Uses v2 SkeletonExtractor: param NAME as placeholder, proper
+        handling of structural params, framework detection.
+        """
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT id, name, code, meta FROM atoms WHERE id = ?", (atom_id,)
+            ).fetchone()
+            if not row:
+                return {"error": f"Atom {atom_id} not found"}
+            
+            meta = pg_sync.dejson(row["meta"] or "{}")
+            concept = meta.get("concept", {})
+            composition = meta.get("composition", {})
+            structural = meta.get("structural", {})
+            
+            if not concept.get("archetype"):
+                return {
+                    "error": f"Atom {atom_id} ({row['name']}) has no concept metadata. "
+                             f"Run ConceptService.extract_concept() first."
+                }
+            
+            archetype = concept["archetype"]
+            section = composition.get("primary_section", "utility")
+            framework = SkeletonExtractor.detect_framework(row["code"], structural)
+            
+            skeleton, param_map, structural_params = SkeletonExtractor.extract(
+                row["code"], concept, composition
+            )
+            
+            result = self.expression_table.register(
+                archetype=archetype, framework=framework, section=section,
+                skeleton=skeleton, parameter_map=param_map,
+                structural_params=structural_params,
+                source_atom_id=atom_id, generated_by="extracted",
+            )
+            
+            result["archetype"] = archetype
+            result["framework"] = framework
+            result["section"] = section
+            result["parameters_mapped"] = len(param_map)
+            result["structural_params"] = len(structural_params)
+            
+            return result
+        finally:
+            conn.close()
+    
+    def learn_all(self) -> Dict[str, Any]:
+        """Learn expressions from all enriched atoms. Clears table first."""
+        # Clear old expressions to re-learn with v2 algorithm
+        self.expression_table.clear()
+        
+        conn = self._get_conn()
+        try:
+            rows = conn.execute("""
+                SELECT id FROM atoms 
+                WHERE json_extract(meta, '$.concept.archetype') IS NOT NULL
+            """).fetchall()
+            
+            results = []
+            for row in rows:
+                result = self.learn_expression(row["id"])
+                results.append(result)
+            
+            registered = sum(1 for r in results if r.get("status") == "registered")
+            updated = sum(1 for r in results if r.get("status") == "updated")
+            failed = sum(1 for r in results if "error" in r)
+            total_params = sum(r.get("parameters_mapped", 0) for r in results if "error" not in r)
+            total_structural = sum(r.get("structural_params", 0) for r in results if "error" not in r)
+            
+            return {
+                "total": len(results),
+                "registered": registered,
+                "updated": updated,
+                "failed": failed,
+                "total_params_mapped": total_params,
+                "total_structural_params": total_structural,
+                "results": results,
+            }
+        finally:
+            conn.close()
+    
+    async def polish(self, code: str, target_framework: str,
+               instructions: Optional[str] = None) -> Dict[str, Any]:
+        """Cheap LLM cleanup pass on mechanical output.
+        
+        Takes ~100-300 tokens. Fixes the ~20% that's rough:
+        imports, variable naming conventions, framework idioms.
+        """
+        # Use Haiku for cheap cleanup pass
+        
+        prompt = f"""You are cleaning up mechanically-generated code for the {target_framework} framework.
+The code below was assembled from semantic concept skeletons. It is approximately 80% correct.
+
+Fix ONLY what's wrong. Do not restructure or redesign. Typical fixes needed:
+- Add missing imports
+- Fix variable naming conventions for the framework
+- Fix framework-specific idioms (e.g., FastAPI Depends(), Express middleware signature)
+- Remove duplicate or conflicting code
+- Fix obvious type issues
+
+{f'Additional instructions: {instructions}' if instructions else ''}
+
+Code to polish:
+```
+{code}
+```
+
+Return ONLY the fixed code. No explanation. No markdown fences."""
+
+        try:
+            response = await self._call_haiku(prompt, max_tokens=2048)
+            if not response:
+                return {"output": code, "polished": False, "reason": "Haiku returned no response"}
+            polished = response.strip()
+            # Strip markdown fences if present
+            if polished.startswith("```"):
+                lines = polished.split("\n")
+                polished = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+            
+            return {
+                "output": polished, "polished": True,
+                "original_length": len(code),
+                "polished_length": len(polished),
+                "tokens_used": len(prompt) // 4 + len(polished) // 4,
+            }
+        except Exception as e:
+            return {
+                "output": code, "polished": False,
+                "reason": f"Haiku error: {str(e)}"
+            }
+    
+    async def _synthesize_skeleton(self, archetype: str, framework: str,
+                             section: str, concept: Dict, composition: Dict,
+                             understanding: Dict, source_atom_id: str
+                             ) -> Optional[Dict[str, Any]]:
+        """Use Haiku ONCE to generate a skeleton for a new framework.
+        
+        This is the self-expanding mechanism. Cost: ~$0.003.
+        After this call, all future prints for this archetype × framework
+        are mechanical (free).
+        """
+        # Haiku generates skeleton for new framework (one-time cost)
+        
+        params = composition.get("parameters", [])
+        param_desc = "\n".join(
+            f"  - {{{{{p['name']}}}}}: {p.get('description', p.get('semantic_role', ''))}"
+            for p in params
+        )
+        
+        constraints = understanding.get("constraints", [])
+        constraint_desc = "\n".join(f"  - {c}" for c in constraints) if constraints else "  (none specified)"
+        
+        prompt = f"""Generate a code skeleton for the following concept in {framework}.
+
+Concept: {concept.get('essence', archetype)}
+Archetype: {archetype}
+Section: {section}
+What: {understanding.get('what', 'N/A')}
+Why: {understanding.get('why', 'N/A')}
+How: {understanding.get('how', 'N/A')}
+Constraints:
+{constraint_desc}
+
+Parameters (use these exact placeholder names):
+{param_desc}
+
+Rules:
+- Write idiomatic {framework} code
+- Use {{{{param_name}}}} syntax for ALL parameter placeholders
+- Include ONLY the function/handler — no imports, no boilerplate
+- This will be section-merged with other code, so just the core pattern
+- Keep it minimal — the cleanup pass will fix details
+
+Return ONLY code. No explanation. No markdown fences."""
+
+        try:
+            response = await self._call_haiku(prompt, max_tokens=1024)
+            if not response:
+                logger.error(f"Haiku returned no response for {archetype} x {framework}")
+                return None
+            skeleton = response.strip()
+            if skeleton.startswith("```"):
+                lines = skeleton.split("\n")
+                skeleton = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+            
+            # Extract parameter map from concept params
+            param_map = {}
+            for p in params:
+                name = p.get("name", "")
+                default = p.get("default")
+                if name and default is not None and str(default) not in ("None", "required parameter"):
+                    param_map[name] = str(default)
+            
+            # Register in expression table
+            self.expression_table.register(
+                archetype=archetype, framework=framework, section=section,
+                skeleton=skeleton, parameter_map=param_map,
+                structural_params=[],
+                source_atom_id=source_atom_id,
+                generated_by="synthesized",
+            )
+            
+            return {"skeleton": skeleton, "parameter_map": param_map}
+        except Exception as e:
+            logger.error(f"Synthesis failed for {archetype} × {framework}: {e}")
+            return None
+    
+    def _fill_skeleton(self, skeleton: str, stored_map: Dict[str, str],
+                       concept_params: List[Dict],
+                       overrides: Dict[str, str]) -> str:
+        """Fill skeleton placeholders with parameter values.
+        
+        Priority: overrides > concept defaults > stored defaults
+        """
+        output = skeleton
+        
+        # Build value lookup: param_name → value
+        values = dict(stored_map)  # defaults from expression table
+        
+        # Override with concept parameter defaults
+        for param in concept_params:
+            name = param.get("name", "")
+            default = param.get("default")
+            if name and default is not None and str(default) not in ("None", "required parameter"):
+                values[name] = str(default)
+        
+        # Override with explicit overrides (user-provided)
+        values.update(overrides)
+        
+        # Fill placeholders
+        for name, value in values.items():
+            placeholder = "{{" + name + "}}"
+            output = output.replace(placeholder, value)
+        
+        return output
+    
+    @staticmethod
+    def _estimate_tokens(code: str) -> int:
+        """Rough estimate of tokens saved by mechanical generation."""
+        return len(code) // 4
+
+
+# ── Singletons ────────────────────────────────────────────────────────
+
+_printer = None
+
+def get_printer() -> MechanicalPrinter:
+    global _printer
+    if _printer is None:
+        _printer = MechanicalPrinter()
+    return _printer
+
+def get_expression_table() -> ExpressionTable:
+    return get_printer().expression_table

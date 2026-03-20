@@ -1,0 +1,9 @@
+chromadb-data/
+data/
+embeddings-cache/
+__pycache__/
+*.pyc
+*.pyo
+.env
+logs/
+*.log

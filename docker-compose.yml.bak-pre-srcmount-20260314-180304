@@ -1,0 +1,137 @@
+services:
+  helix-cortex:
+    build: .
+    container_name: helix-cortex
+    restart: unless-stopped
+    ports:
+      - "9050:9050"
+    volumes:
+      - ./data:/app/data
+      - /opt/projects:/opt/projects
+      - /opt/data/working-kb:/app/working-kb:rw
+    env_file:
+      - .env
+    networks:
+      - coolify
+      - helix
+      - shared
+      - mcp-network
+    depends_on:
+      helix-postgres:
+        condition: service_healthy
+      helix-embeddings:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9050/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=coolify"
+      - "traefik.http.routers.helix.rule=Host(`helix.millyweb.com`)"
+      - "traefik.http.routers.helix.entrypoints=https"
+      - "traefik.http.routers.helix.tls.certresolver=letsencrypt"
+      - "traefik.http.services.helix.loadbalancer.server.port=9050"
+
+  helix-chromadb:
+    image: chromadb/chroma:0.5.23
+    container_name: helix-chromadb
+    restart: unless-stopped
+    volumes:
+      - ./chromadb-data:/chroma/chroma
+    environment:
+      - ANONYMIZED_TELEMETRY=False
+    networks:
+      - helix
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8000"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ─── Phase 1 sidecars ───
+
+  helix-postgres:
+    image: pgvector/pgvector:pg16
+    container_name: helix-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: helix
+      POSTGRES_USER: helix
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    ports:
+      - "9037:5432"
+    networks:
+      - helix
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U helix"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  helix-neo4j:
+    image: neo4j:5.18-community
+    container_name: helix-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    volumes:
+      - ./neo4j-data:/data
+    ports:
+      - "9038:7474"
+      - "9039:7687"
+    networks:
+      - helix
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  helix-redis:
+    image: redis:7-alpine
+    container_name: helix-redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    networks:
+      - helix
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  helix-embeddings:
+    build: ./services/embeddings
+    container_name: helix-embeddings
+    restart: unless-stopped
+    environment:
+      EMBEDDING_MODEL: BAAI/bge-large-en-v1.5
+    volumes:
+      - ./embeddings-cache:/root/.cache
+    networks:
+      - helix
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+networks:
+  coolify:
+    external: true
+  helix:
+    name: helix
+  shared:
+    external: true
+  mcp-network:
+    external: true

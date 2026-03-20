@@ -1,0 +1,783 @@
+"""Workbench Service — Unified Editor Operations
+
+The write layer that sits in front of all Helix intelligence.
+Every file operation can flow through here and fan out to every subsystem.
+
+Unified flow (default):  write → version → scan → index → KG → observer
+Granular: call any step individually.
+"""
+import hashlib
+import uuid
+import json
+import logging
+import os
+import re
+import sqlite3
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+
+import httpx
+
+log = logging.getLogger("helix.workbench")
+
+DB_PATH = os.environ.get("DB_PATH", "/app/data/cortex.db")
+FORGE_URL = os.environ.get("FORGE_URL", "http://the-forge:9095")
+WORKING_KB_PATH = "/app/working-kb"
+
+# File type classification
+CODE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".rb",
+    ".java", ".c", ".cpp", ".h", ".cs", ".sh", ".bash",
+}
+CONFIG_EXTENSIONS = {
+    ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf",
+    ".env", ".json", ".xml",
+}
+DOC_EXTENSIONS = {
+    ".md", ".txt", ".rst", ".adoc", ".html",
+}
+COMPOSE_PATTERNS = {"docker-compose", "compose.yml", "compose.yaml"}
+
+
+def _classify_file(file_path: str, content: str = "") -> str:
+    """Classify file type: code, config, doc, compose, dockerfile, unknown."""
+    p = Path(file_path)
+    name = p.name.lower()
+    ext = p.suffix.lower()
+
+    if name == "dockerfile" or name.startswith("dockerfile."):
+        return "dockerfile"
+    if any(pat in name for pat in COMPOSE_PATTERNS):
+        return "compose"
+    if ext in CODE_EXTENSIONS:
+        return "code"
+    if ext in CONFIG_EXTENSIONS:
+        return "config"
+    if ext in DOC_EXTENSIONS:
+        return "doc"
+    if content and re.search(r"^(def |class |import |from |async def )", content, re.M):
+        return "code"
+    return "unknown"
+
+
+def _content_hash(content: str) -> str:
+    return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+
+class WorkbenchService:
+    """Unified editor operations for file management and intelligence."""
+
+    def __init__(self):
+        self._http: Optional[httpx.AsyncClient] = None
+
+    @property
+    def http(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(timeout=30)
+        return self._http
+
+    def _db(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    # ================================================================
+    # 1. FILE WRITE — write to VPS disk
+    # ================================================================
+    def write_file(self, path: str, content: str, create_dirs: bool = True) -> Dict[str, Any]:
+        """Write content to a file on the VPS."""
+        try:
+            p = Path(path)
+            if create_dirs:
+                p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+            return {
+                "status": "written",
+                "path": str(p),
+                "size_bytes": len(content.encode()),
+                "hash": _content_hash(content),
+            }
+        except Exception as e:
+            log.error(f"File write failed: {path}: {e}")
+            return {"status": "error", "error": str(e), "path": path}
+
+    # ================================================================
+    # 2. FILE READ — read from VPS disk
+    # ================================================================
+    def read_file(self, path: str) -> Dict[str, Any]:
+        """Read a file from the VPS."""
+        try:
+            p = Path(path)
+            if not p.exists():
+                return {"status": "error", "error": f"File not found: {path}"}
+            content = p.read_text()
+            return {
+                "status": "ok",
+                "path": str(p),
+                "content": content,
+                "size_bytes": len(content.encode()),
+                "file_type": _classify_file(path, content),
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e), "path": path}
+
+    # ================================================================
+    # 3. VERSION — save to MinIO via Forge for versioning
+    # ================================================================
+    async def version_file(self, path: str, content: str, project: Optional[str] = None) -> Dict[str, Any]:
+        """Send file to Forge for MinIO versioning and atom scanning."""
+        try:
+            # Forge workspace path = relative to /opt/projects
+            workspace_path = path
+            if path.startswith("/opt/projects/"):
+                workspace_path = path[len("/opt/projects/"):]
+            elif path.startswith("/app/working-kb/"):
+                workspace_path = "working-kb/" + path[len("/app/working-kb/"):]
+
+            resp = await self.http.post(
+                f"{FORGE_URL}/api/workspace/write",
+                json={
+                    "path": workspace_path,
+                    "content": content,
+                    "project": project,
+                }
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return {"status": "versioned", "forge_response": data}
+            else:
+                return {"status": "error", "error": f"Forge returned {resp.status_code}: {resp.text[:200]}"}
+        except Exception as e:
+            log.warning(f"Forge versioning failed (non-fatal): {e}")
+            return {"status": "skipped", "reason": str(e)}
+
+    # ================================================================
+    # 4. SCAN CODE — extract atoms/patterns
+    # ================================================================
+    async def scan_code(self, content: str, file_path: str = "", language: Optional[str] = None) -> Dict[str, Any]:
+        """Scan code content for atoms and patterns via Forge."""
+        try:
+            if not language:
+                ext = Path(file_path).suffix.lower() if file_path else ""
+                lang_map = {".py": "python", ".js": "javascript", ".ts": "typescript",
+                            ".go": "go", ".rs": "rust", ".sh": "bash"}
+                language = lang_map.get(ext, "python")
+
+            resp = await self.http.post(
+                f"{FORGE_URL}/api/forge/scan",
+                json={"content": content, "language": language, "file_path": file_path}
+            )
+            if resp.status_code == 200:
+                return {"status": "scanned", **resp.json()}
+            else:
+                return {"status": "error", "error": f"Forge scan returned {resp.status_code}"}
+        except Exception as e:
+            log.warning(f"Code scan failed (non-fatal): {e}")
+            return {"status": "skipped", "reason": str(e)}
+
+    # ================================================================
+    # 5. INDEX KB — add document to knowledge base
+    # ================================================================
+    def index_kb(
+        self, path: str, content: str,
+        title: Optional[str] = None,
+        source: str = "workbench"
+    ) -> Dict[str, Any]:
+        """Index a document into Helix's unified KB."""
+        try:
+            if not title:
+                # Extract from first heading or filename
+                m = re.search(r"^#\s+(.+)$", content, re.M)
+                title = m.group(1) if m else Path(path).stem.replace("-", " ").replace("_", " ").title()
+
+            doc_id = f"{source}:{path}"
+            content_hash = _content_hash(content)
+
+            conn = self._db()
+            try:
+                # Upsert
+                existing = conn.execute(
+                    "SELECT content_hash FROM kb_documents WHERE id = ?", (doc_id,)
+                ).fetchone()
+
+                now = datetime.now(timezone.utc).isoformat()
+
+                if existing and existing["content_hash"] == content_hash:
+                    return {"status": "unchanged", "id": doc_id}
+
+                if existing:
+                    conn.execute(
+                        """UPDATE kb_documents SET title=?, content=?, content_hash=?,
+                           size_bytes=?, indexed_at=?, source=?, path=?
+                           WHERE id=?""",
+                        (title, content, content_hash, len(content.encode()),
+                         now, source, path, doc_id)
+                    )
+                    # Update FTS
+                    conn.execute("DELETE FROM kb_fts WHERE rowid = (SELECT rowid FROM kb_documents WHERE id = ?)", (doc_id,))
+                else:
+                    conn.execute(
+                        """INSERT INTO kb_documents (id, title, content, content_hash,
+                           size_bytes, indexed_at, source, path)
+                           VALUES (?,?,?,?,?,?,?,?)""",
+                        (doc_id, title, content, content_hash,
+                         len(content.encode()), now, source, path)
+                    )
+
+                # Rebuild FTS entry
+                rowid = conn.execute("SELECT rowid FROM kb_documents WHERE id = ?", (doc_id,)).fetchone()[0]
+                conn.execute(
+                    "INSERT INTO kb_fts(rowid, title, content, source, path) VALUES (?,?,?,?,?)",
+                    (rowid, title, content, source, path)
+                )
+                conn.commit()
+                return {
+                    "status": "updated" if existing else "indexed",
+                    "id": doc_id,
+                    "title": title,
+                }
+            finally:
+                conn.close()
+        except Exception as e:
+            log.error(f"KB index failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    # ================================================================
+    # 6. EXTRACT ENTITIES — update knowledge graph
+    # ================================================================
+    def extract_entities(
+        self, content: str, file_path: str = "",
+        session_id: str = "workbench"
+    ) -> Dict[str, Any]:
+        """Extract entity mentions from content and record in KG."""
+        try:
+            # Simple entity extraction: containers, ports, domains, paths
+            entities_found = []
+            conn = self._db()
+            try:
+                # Container names (word-word pattern common in docker)
+                containers = set(re.findall(r'\b((?:mcp|helix|the)-[a-z][a-z0-9-]+)\b', content))
+                # Ports
+                ports = set(re.findall(r'\b(\d{4,5})(?::\d{4,5})?\b', content))
+                ports = {p for p in ports if 1024 <= int(p) <= 65535}
+                # Domains
+                domains = set(re.findall(r'\b([a-z][a-z0-9-]+\.millyweb\.com)\b', content))
+                # Paths
+                project_paths = set(re.findall(r'/opt/projects/([a-z][a-z0-9-]+)', content))
+
+                now = datetime.now(timezone.utc).isoformat()
+
+                for name in containers:
+                    self._upsert_entity(conn, name, "container", session_id, now, file_path)
+                    entities_found.append({"name": name, "type": "container"})
+                for domain in domains:
+                    self._upsert_entity(conn, domain, "domain", session_id, now, file_path)
+                    entities_found.append({"name": domain, "type": "domain"})
+                for proj in project_paths:
+                    self._upsert_entity(conn, proj, "project", session_id, now, file_path)
+                    entities_found.append({"name": proj, "type": "project"})
+
+                conn.commit()
+                return {"status": "extracted", "entities": entities_found, "count": len(entities_found)}
+            finally:
+                conn.close()
+        except Exception as e:
+            log.error(f"Entity extraction failed: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def _upsert_entity(
+        self, conn: sqlite3.Connection, name: str, entity_type: str,
+        session_id: str, timestamp: str, context: str
+    ):
+        """Upsert an entity and record a mention."""
+        existing = conn.execute(
+            "SELECT id, mention_count FROM entities WHERE name = ? COLLATE NOCASE", (name,)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE entities SET mention_count = mention_count + 1, last_seen = ? WHERE id = ?",
+                (timestamp, existing["id"])
+            )
+        else:
+            entity_id = uuid.uuid4().hex[:12]
+            conn.execute(
+                "INSERT INTO entities (id, name, entity_type, mention_count, first_seen, last_seen) VALUES (?,?,?,1,?,?)",
+                (entity_id, name, entity_type, timestamp, timestamp)
+            )
+        conn.execute(
+            "INSERT INTO kg_mentions (entity_name, session_id, context, mentioned_at) VALUES (?,?,?,?)",
+            (name, session_id, context[:500], timestamp)
+        )
+
+    # ================================================================
+    # 7. LOG ACTIVITY — record in observer
+    # ================================================================
+    def log_activity(
+        self, action: str, path: str = "",
+        details: Optional[Dict[str, Any]] = None,
+        session_id: str = "workbench"
+    ) -> Dict[str, Any]:
+        """Record a file operation in the observer log."""
+        try:
+            conn = self._db()
+            try:
+                now = datetime.now(timezone.utc).isoformat()
+                conn.execute(
+                    """INSERT INTO observer_actions
+                       (tool_name, arguments_json, result_summary, session_id, timestamp, category, file_path)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (
+                        f"workbench.{action}",
+                        json.dumps({"path": path, **(details or {})}),
+                        f"{action}: {path}",
+                        session_id,
+                        now,
+                        "file_operation",
+                        path,
+                    )
+                )
+                conn.commit()
+                return {"status": "logged", "action": action}
+            finally:
+                conn.close()
+        except Exception as e:
+            log.warning(f"Observer log failed (non-fatal): {e}")
+            return {"status": "skipped", "reason": str(e)}
+
+    # ================================================================
+    # UNIFIED WRITE — the full pipeline
+    # ================================================================
+    async def write(
+        self,
+        path: str,
+        content: str,
+        # Control which steps run:
+        save: bool = True,
+        version: bool = True,
+        scan: bool = True,    # auto-detects: only code files
+        index: bool = True,   # auto-detects: only doc/config files
+        entities: bool = True,
+        log_it: bool = True,
+        # Metadata:
+        title: Optional[str] = None,
+        project: Optional[str] = None,
+        session_id: str = "workbench",
+    ) -> Dict[str, Any]:
+        """Full pipeline: write → version → scan → index → entities → observer.
+
+        Smart defaults based on file type:
+          code files   → write + version + scan + entities + log
+          doc files    → write + version + index + entities + log
+          config files → write + version + index + entities + log
+          other        → write + version + log
+        """
+        results = {"path": path, "steps": {}}
+        file_type = _classify_file(path, content)
+        results["file_type"] = file_type
+
+        # Auto-detect smart defaults
+        is_code = file_type in ("code", "dockerfile")
+        is_doc = file_type in ("doc", "config", "compose")
+
+        # 1. Write to disk
+        if save:
+            results["steps"]["write"] = self.write_file(path, content)
+            if results["steps"]["write"]["status"] == "error":
+                return results  # stop on write failure
+
+        # 2. Version in MinIO
+        if version:
+            results["steps"]["version"] = await self.version_file(path, content, project)
+
+        # 3. Scan for code patterns
+        if scan and is_code:
+            results["steps"]["scan"] = await self.scan_code(content, path)
+
+        # 4. Index into KB
+        if index and is_doc:
+            results["steps"]["index"] = self.index_kb(path, content, title=title)
+
+        # 5. Extract entities
+        if entities:
+            results["steps"]["entities"] = self.extract_entities(content, path, session_id)
+
+        # 6. Log to observer
+        if log_it:
+            results["steps"]["observer"] = self.log_activity(
+                "write", path,
+                {"file_type": file_type, "size": len(content.encode()),
+                 "steps_run": list(results["steps"].keys())},
+                session_id
+            )
+
+        # 7. Queue snapshot for changed component (non-blocking, code files only)
+        if is_code:
+            try:
+                from services.snapshots import queue_snapshot_for_file
+                component = queue_snapshot_for_file(path, context=session_id)
+                results["steps"]["snapshot"] = {"status": "queued", "component": component} if component else {"status": "no_match"}
+            except Exception as _se:
+                results["steps"]["snapshot"] = {"status": "skipped", "reason": str(_se)}
+
+        results["status"] = "complete"
+        return results
+
+    # ================================================================
+    # MOVE / DELETE
+    # ================================================================
+    async def move_file(self, src: str, dst: str) -> Dict[str, Any]:
+        """Move a file on VPS and update Forge workspace."""
+        try:
+            src_p, dst_p = Path(src), Path(dst)
+            if not src_p.exists():
+                return {"status": "error", "error": f"Source not found: {src}"}
+            dst_p.parent.mkdir(parents=True, exist_ok=True)
+            src_p.rename(dst_p)
+
+            # Update Forge
+            try:
+                ws_src = src.replace("/opt/projects/", "") if src.startswith("/opt/projects/") else src
+                ws_dst = dst.replace("/opt/projects/", "") if dst.startswith("/opt/projects/") else dst
+                await self.http.post(
+                    f"{FORGE_URL}/api/workspace/move",
+                    json={"source": ws_src, "destination": ws_dst}
+                )
+            except Exception:
+                pass  # non-fatal
+
+            self.log_activity("move", dst, {"from": src, "to": dst})
+            return {"status": "moved", "from": src, "to": dst}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def delete_file(self, path: str) -> Dict[str, Any]:
+        """Delete a file from VPS."""
+        try:
+            p = Path(path)
+            if not p.exists():
+                return {"status": "error", "error": f"Not found: {path}"}
+            p.unlink()
+            self.log_activity("delete", path)
+            return {"status": "deleted", "path": path}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def list_dir(self, path: str, recursive: bool = False, max_depth: int = 2) -> Dict[str, Any]:
+        """List directory contents."""
+        try:
+            p = Path(path)
+            if not p.exists():
+                return {"status": "error", "error": f"Not found: {path}"}
+            if not p.is_dir():
+                return {"status": "error", "error": f"Not a directory: {path}"}
+
+            items = []
+            for item in sorted(p.iterdir()):
+                if item.name.startswith("."):
+                    continue
+                entry = {
+                    "name": item.name,
+                    "type": "dir" if item.is_dir() else "file",
+                    "path": str(item),
+                }
+                if item.is_file():
+                    entry["size"] = item.stat().st_size
+                    entry["file_type"] = _classify_file(str(item))
+                items.append(entry)
+
+            return {"status": "ok", "path": path, "count": len(items), "items": items}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+
+# Singleton
+_instance: Optional[WorkbenchService] = None
+
+def get_workbench() -> WorkbenchService:
+    global _instance
+    if _instance is None:
+        _instance = WorkbenchService()
+    return _instance
+
+
+# ================================================================
+# MODULE-LEVEL CONVENIENCE FUNCTIONS (called by MCP tools)
+# ================================================================
+
+def classify_file(path: str, content: str = "") -> str:
+    """Classify a file type from its path."""
+    return _classify_file(path, content)
+
+
+def read_file(path: str) -> Dict[str, Any]:
+    """Read a file from VPS."""
+    return get_workbench().read_file(path)
+
+
+def index_kb(
+    content: str, path: str, source: str = "workbench", title: Optional[str] = None
+) -> Dict[str, Any]:
+    """Index a document into the KB."""
+    return get_workbench().index_kb(path, content, title=title, source=source)
+
+
+async def scan_code(
+    content: str, path: str = "<scan>", language: Optional[str] = None
+) -> Dict[str, Any]:
+    """Scan code for atoms via Forge."""
+    return await get_workbench().scan_code(content, path, language)
+
+
+async def pipeline(
+    path: str,
+    content: str,
+    context: str = "",
+    do_write: bool = True,
+    do_scan: Optional[bool] = None,
+    do_kb_index: Optional[bool] = None,
+    do_kg_extract: Optional[bool] = None,
+    do_observe: bool = True,
+    kb_source: Optional[str] = None,
+    kb_title: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Unified write pipeline — the main Editor operation.
+
+    All steps auto-detect based on file type unless overridden.
+    """
+    wb = get_workbench()
+    file_type = _classify_file(path, content)
+    is_code = file_type in ("code", "dockerfile")
+    is_doc = file_type in ("doc", "config", "compose")
+
+    # Resolve auto-detect flags
+    should_scan = do_scan if do_scan is not None else is_code
+    should_index = do_kb_index if do_kb_index is not None else is_doc
+    should_kg = do_kg_extract if do_kg_extract is not None else True
+
+    # Auto-detect KB source from path
+    source = kb_source
+    if not source:
+        if "/working-kb/" in path or path.startswith("/app/working-kb"):
+            source = "working-kb"
+        elif "/infra-kb/" in path:
+            source = "infra-kb"
+        else:
+            source = "workbench"
+
+    return await wb.write(
+        path=path,
+        content=content,
+        save=do_write,
+        version=True,
+        scan=should_scan,
+        index=should_index,
+        entities=should_kg,
+        log_it=do_observe,
+        title=kb_title,
+        project=None,
+        session_id=context or "workbench",
+    )
+
+
+# ================================================================
+# EXPRESSION-BASED FILE EDITING
+# ================================================================
+
+def edit_file(
+    path: str,
+    operations: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Apply expression-based edits to an existing file.
+
+    Instead of rewriting the entire file, send only the changes.
+    Reads current file, applies operations sequentially, returns result.
+
+    Operations:
+      {"op": "replace", "old": "...", "new": "..."}          - str_replace (must be unique)
+      {"op": "insert_after", "anchor": "...", "content": "..."}  - insert after anchor line
+      {"op": "insert_before", "anchor": "...", "content": "..."}  - insert before anchor line
+      {"op": "append", "content": "..."}                        - append to end of file
+      {"op": "prepend", "content": "..."}                       - prepend to start of file
+      {"op": "delete", "target": "..."}                         - delete exact match
+      {"op": "replace_lines", "start": N, "end": M, "content": "..."}  - replace line range (1-indexed)
+      {"op": "regex_replace", "pattern": "...", "replacement": "...", "count": 1}
+
+    Returns dict with status, operations applied, before/after sizes, and diff summary.
+    """
+    p = Path(path)
+    if not p.exists():
+        return {"status": "error", "error": f"File not found: {path}"}
+
+    original = p.read_text()
+    content = original
+    applied = []
+    errors = []
+
+    for i, op_def in enumerate(operations):
+        op = op_def.get("op", "")
+        try:
+            if op == "replace":
+                old = op_def["old"]
+                new = op_def.get("new", "")
+                count = content.count(old)
+                if count == 0:
+                    errors.append(f"Op {i} replace: target string not found")
+                elif count > 1:
+                    errors.append(f"Op {i} replace: target string found {count} times (must be unique)")
+                else:
+                    content = content.replace(old, new, 1)
+                    applied.append(f"replace: {len(old)} chars -> {len(new)} chars")
+
+            elif op == "insert_after":
+                anchor = op_def["anchor"]
+                insert = op_def["content"]
+                idx = content.find(anchor)
+                if idx < 0:
+                    errors.append(f"Op {i} insert_after: anchor not found")
+                else:
+                    end = idx + len(anchor)
+                    nl = content.find("\n", end)
+                    if nl < 0:
+                        nl = len(content)
+                    content = content[:nl] + "\n" + insert + content[nl:]
+                    applied.append(f"insert_after: +{len(insert)} chars")
+
+            elif op == "insert_before":
+                anchor = op_def["anchor"]
+                insert = op_def["content"]
+                idx = content.find(anchor)
+                if idx < 0:
+                    errors.append(f"Op {i} insert_before: anchor not found")
+                else:
+                    line_start = content.rfind("\n", 0, idx)
+                    line_start = 0 if line_start < 0 else line_start + 1
+                    content = content[:line_start] + insert + "\n" + content[line_start:]
+                    applied.append(f"insert_before: +{len(insert)} chars")
+
+            elif op == "append":
+                insert = op_def["content"]
+                if not content.endswith("\n"):
+                    content += "\n"
+                content += insert
+                applied.append(f"append: +{len(insert)} chars")
+
+            elif op == "prepend":
+                insert = op_def["content"]
+                content = insert + ("\n" if not insert.endswith("\n") else "") + content
+                applied.append(f"prepend: +{len(insert)} chars")
+
+            elif op == "delete":
+                target = op_def["target"]
+                if target not in content:
+                    errors.append(f"Op {i} delete: target not found")
+                else:
+                    content = content.replace(target, "", 1)
+                    applied.append(f"delete: -{len(target)} chars")
+
+            elif op == "replace_lines":
+                lines = content.split("\n")
+                start = op_def["start"] - 1
+                end = op_def["end"]
+                new_content = op_def.get("content", "")
+                if start < 0 or end > len(lines):
+                    errors.append(f"Op {i} replace_lines: range out of bounds (file has {len(lines)} lines)")
+                else:
+                    old_lines = lines[start:end]
+                    new_lines = new_content.split("\n") if new_content else []
+                    lines[start:end] = new_lines
+                    content = "\n".join(lines)
+                    applied.append(f"replace_lines {start+1}-{end}: {len(old_lines)} -> {len(new_lines)} lines")
+
+            elif op == "regex_replace":
+                pattern = op_def["pattern"]
+                replacement = op_def.get("replacement", "")
+                count = op_def.get("count", 0)
+                compiled = re.compile(pattern, re.MULTILINE)
+                new_content, n = compiled.subn(replacement, content, count=count)
+                if n == 0:
+                    errors.append(f"Op {i} regex_replace: pattern not matched")
+                else:
+                    content = new_content
+                    applied.append(f"regex_replace: {n} substitution(s)")
+
+            else:
+                errors.append(f"Op {i}: unknown operation '{op}'")
+
+        except KeyError as e:
+            errors.append(f"Op {i} {op}: missing required field {e}")
+        except Exception as e:
+            errors.append(f"Op {i} {op}: {e}")
+
+    if errors and not applied:
+        return {
+            "status": "error",
+            "errors": errors,
+            "path": path,
+            "operations_attempted": len(operations),
+        }
+
+    original_tokens = len(original) // 4
+    ops_tokens = sum(len(json.dumps(op)) for op in operations) // 4
+    tokens_saved = max(0, original_tokens - ops_tokens)
+
+    return {
+        "status": "edited" if applied else "no_changes",
+        "path": path,
+        "applied": applied,
+        "errors": errors if errors else None,
+        "before_size": len(original),
+        "after_size": len(content),
+        "delta_bytes": len(content) - len(original),
+        "tokens_saved_estimate": tokens_saved,
+        "content": content,
+    }
+
+
+# ================================================================
+# SHELL EXECUTION (inside Helix container)
+# ================================================================
+
+def run_shell(command: str, cwd: str = None, timeout: int = 30) -> Dict[str, Any]:
+    """Run a shell command inside the Helix container.
+
+    Captures stdout, stderr, exit code. Structured logging to observer.
+    Useful for: git on mounted repos, file manipulation, curl internal services, sqlite.
+    For host docker/systemctl, use ssh_execute via gateway.
+    """
+    import subprocess
+    import time as _time
+
+    start = _time.time()
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True,
+            timeout=timeout, cwd=cwd,
+        )
+        duration = _time.time() - start
+
+        output = {
+            "status": "ok" if result.returncode == 0 else "error",
+            "exit_code": result.returncode,
+            "stdout": result.stdout[-10000:] if len(result.stdout) > 10000 else result.stdout,
+            "stderr": result.stderr[-5000:] if len(result.stderr) > 5000 else result.stderr,
+            "duration_ms": round(duration * 1000),
+            "command": command[:500],
+        }
+
+        try:
+            wb = get_workbench()
+            wb.log_activity("shell", cwd or "/app", {
+                "command": command[:200], "exit_code": result.returncode,
+                "stdout_len": len(result.stdout), "stderr_len": len(result.stderr),
+                "duration_ms": output["duration_ms"],
+            })
+        except Exception:
+            pass
+
+        return output
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "command": command[:500], "timeout": timeout}
+    except Exception as e:
+        return {"status": "error", "error": str(e), "command": command[:500]}

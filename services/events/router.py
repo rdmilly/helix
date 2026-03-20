@@ -1,0 +1,70 @@
+"""Event Router — Maps event_type to handler function
+
+The single lookup table the MitochondriaWorker uses to dispatch events.
+Adding a new event = adding one line here + writing a handler.
+
+All handlers have the signature:
+    async def handle_*(payload: Dict[str, Any]) -> Dict[str, Any]
+"""
+import logging
+from typing import Any, Callable, Dict, Optional
+
+log = logging.getLogger("helix.events.router")
+
+# Event type → handler function (lazy-loaded to avoid circular imports)
+EVENT_HANDLERS: Dict[str, str] = {
+    "file.written":       "services.events.file_events.handle_file_written",
+    "file.read":          "services.events.file_events.handle_file_read",
+    "session.ingested":   "services.events.session_events.handle_session_ingested",
+    "exchange.posted":    "services.events.exchange_events.handle_exchange_posted",
+    "entity.upserted":   "services.events.kg_events.handle_entity_upserted",
+    "synapse.completed": "services.events.synapse_events.handle_synapse_completed",
+    "archive.recorded": "services.events.archive_events.handle_archive_recorded",
+    "pattern.detected": "services.events.pattern_events.handle_pattern_detected",
+    "turn.flush":        "services.events.turn_events.handle_turn_flush",
+}
+
+
+def is_event(intake_type: str) -> bool:
+    """Return True if this intake_type is an event (has a dot)."""
+    return "." in intake_type
+
+
+async def dispatch(event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Dispatch an event to its registered handler.
+
+    Called by MitochondriaWorker for any queue item where
+    intake_type contains a '.' (indicating it's an event).
+
+    Returns handler result or error dict — never raises.
+    """
+    handler_path = EVENT_HANDLERS.get(event_type)
+
+    if not handler_path:
+        log.warning(f"No handler registered for event: {event_type}")
+        return {"status": "unhandled", "event": event_type}
+
+    try:
+        handler = _load_handler(handler_path)
+        result = await handler(payload)
+        return result
+    except Exception as e:
+        log.error(f"Event handler failed ({event_type}): {e}", exc_info=True)
+        return {"status": "error", "event": event_type, "error": str(e)}
+
+
+def _load_handler(handler_path: str) -> Callable:
+    """Dynamically import and return a handler function.
+
+    handler_path format: 'module.submodule.function_name'
+    """
+    parts = handler_path.rsplit(".", 1)
+    if len(parts) != 2:
+        raise ValueError(f"Invalid handler path: {handler_path}")
+
+    module_path, func_name = parts
+
+    import importlib
+    module = importlib.import_module(module_path)
+    handler = getattr(module, func_name)
+    return handler

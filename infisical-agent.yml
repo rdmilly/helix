@@ -1,0 +1,23 @@
+# Infisical Agent Config - Helix Cortex
+# Fetches external API keys from Infisical and writes to /secrets/helix.env
+# Refreshes every 5 minutes automatically
+
+infisical:
+  address: "http://72.60.225.81:8095"
+
+auth:
+  type: "universal-auth"
+  config:
+    client-id: "/secrets/client-id"
+    client-secret: "/secrets/client-secret"
+
+sinks:
+  - type: "file"
+    config:
+      path: "/secrets/agent-token"
+
+templates:
+  - template-path: "/config/helix-secrets.tmpl"
+    destination-path: "/secrets/helix.env"
+    config:
+      polling-interval: "5m"

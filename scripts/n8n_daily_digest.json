@@ -1,0 +1,114 @@
+{
+  "name": "Helix Daily Context Digest",
+  "nodes": [
+    {
+      "id": "trigger",
+      "name": "Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300],
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "hours", "hoursInterval": 24 }]
+        },
+        "triggerAtHour": 6,
+        "triggerAtMinute": 0
+      }
+    },
+    {
+      "id": "fetch_recent_sessions",
+      "name": "Fetch Recent Sessions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "http://helix-cortex:9050/api/v1/archive/sessions?limit=20",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-API-Key", "value": "ce-prod-6292b483717db14c83924a52715988ae" }]
+        }
+      }
+    },
+    {
+      "id": "fetch_recent_decisions",
+      "name": "Fetch Recent Decisions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 460],
+      "parameters": {
+        "method": "GET",
+        "url": "http://helix-cortex:9050/api/v1/archive/decisions?limit=15",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-API-Key", "value": "ce-prod-6292b483717db14c83924a52715988ae" }]
+        }
+      }
+    },
+    {
+      "id": "build_digest_prompt",
+      "name": "Build Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [700, 380],
+      "parameters": {
+        "jsCode": "const sessions = $('Fetch Recent Sessions').first().json?.entries || [];\nconst decisions = $('Fetch Recent Decisions').first().json?.entries || [];\n\nconst today = new Date().toISOString().slice(0,10);\n\n// Filter to last 24h\nconst cutoff = new Date(Date.now() - 86400000).toISOString();\nconst recentSessions = sessions.filter(s => s.created_at > cutoff);\nconst recentDecisions = decisions.filter(d => d.created_at > cutoff);\n\nconst sessionText = recentSessions.length\n  ? recentSessions.map(s => `- ${s.content?.slice(0,200) || s.title || ''}`.trim()).join('\\n')\n  : 'No new sessions';\n\nconst decisionText = recentDecisions.length\n  ? recentDecisions.map(d => `- ${d.content?.slice(0,150) || ''}`.trim()).join('\\n')\n  : 'No new decisions';\n\nconst prompt = `Today is ${today}. Summarize this into a 3-5 sentence daily context digest for an AI assistant. Focus on: what was built/changed yesterday, any key decisions made, and what ongoing work needs attention.\n\nRecent Sessions:\n${sessionText}\n\nRecent Decisions:\n${decisionText}\n\nWrite ONLY the digest paragraph. No preamble.`;\n\nreturn [{ json: { prompt, sessionCount: recentSessions.length, decisionCount: recentDecisions.length, today } }];"
+      }
+    },
+    {
+      "id": "call_haiku",
+      "name": "Summarize via Haiku",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [940, 380],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" },
+            { "name": "x-api-key", "value": "={{$env.ANTHROPIC_API_KEY}}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={\"model\":\"claude-haiku-4-5-20251001\",\"max_tokens\":512,\"messages\":[{\"role\":\"user\",\"content\":\"{{ $json.prompt }}\"}]}"
+      }
+    },
+    {
+      "id": "write_handoff",
+      "name": "Update Handoff Doc",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1180, 380],
+      "parameters": {
+        "method": "POST",
+        "url": "http://helix-cortex:9050/api/v1/kb/update",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-API-Key", "value": "ce-prod-6292b483717db14c83924a52715988ae" }]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "path": "projects/memory/daily-digest.md",
+          "content": "# Daily Digest — {{ $('Build Digest').first().json.today }}\n\n{{ $json.content[0].text }}\n\n_Generated: {{ $now.toISO() }}_",
+          "commit_message": "n8n: daily digest {{ $('Build Digest').first().json.today }}"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule": {
+      "main": [[{ "node": "Fetch Recent Sessions", "type": "main", "index": 0 }, { "node": "Fetch Recent Decisions", "type": "main", "index": 0 }]]
+    },
+    "Fetch Recent Sessions": { "main": [[{ "node": "Build Digest", "type": "main", "index": 0 }]] },
+    "Fetch Recent Decisions": { "main": [[{ "node": "Build Digest", "type": "main", "index": 1 }]] },
+    "Build Digest": { "main": [[{ "node": "Summarize via Haiku", "type": "main", "index": 0 }]] },
+    "Summarize via Haiku": { "main": [[{ "node": "Update Handoff Doc", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" }
+}

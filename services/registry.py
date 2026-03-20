@@ -1,0 +1,257 @@
+"""Registry Service - Type Registry & Namespace Registry
+
+Manages type_registry (extensible classification) and meta_namespaces (schema registry).
+"""
+import json
+from services import pg_sync
+import logging
+from typing import Dict, Any, List, Optional
+from datetime import datetime
+from services.database import get_db
+
+logger = logging.getLogger(__name__)
+
+
+class RegistryService:
+    """Manages type and namespace registries"""
+    
+    def __init__(self):
+        self.db = get_db()
+        self._type_cache = {}
+        self._namespace_cache = {}
+    
+    # === TYPE REGISTRY ===
+    
+    def register_type(
+        self,
+        type_name: str,
+        category: str,
+        handler: str,
+        registered_by: str,
+        config: Optional[Dict[str, Any]] = None,
+        active: bool = True
+    ) -> bool:
+        """Register a new type in the registry"""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute("""
+                    INSERT INTO type_registry 
+                    (type_name, category, handler, registered_by, config, active)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    type_name,
+                    category,
+                    handler,
+                    registered_by,
+                    json.dumps(config or {}),
+                    1 if active else 0
+                ))
+                
+                conn.commit()
+                self._type_cache.clear()  # Invalidate cache
+                logger.info(f"Registered type: {type_name} ({category})")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Failed to register type {type_name}: {e}")
+                return False
+    
+    def get_type(self, type_name: str) -> Optional[Dict[str, Any]]:
+        """Get type registration by name"""
+        if type_name in self._type_cache:
+            return self._type_cache[type_name]
+        
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT type_name, category, handler, registered_by, registered_at, config, active
+                FROM type_registry
+                WHERE type_name = ?
+            """, (type_name,))
+            
+            row = cursor.fetchone()
+            if not row:
+                return None
+            
+            type_info = {
+                "type_name": row[0],
+                "category": row[1],
+                "handler": row[2],
+                "registered_by": row[3],
+                "registered_at": row[4],
+                "config": pg_sync.dejson(row[5]),
+                "active": bool(row[6])
+            }
+            
+            self._type_cache[type_name] = type_info
+            return type_info
+    
+    def get_types_by_category(self, category: str, active_only: bool = True) -> List[Dict[str, Any]]:
+        """Get all types in a category"""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            if active_only:
+                cursor.execute("""
+                    SELECT type_name, category, handler, registered_by, registered_at, config, active
+                    FROM type_registry
+                    WHERE category = ? AND active = 1
+                    ORDER BY type_name
+                """, (category,))
+            else:
+                cursor.execute("""
+                    SELECT type_name, category, handler, registered_by, registered_at, config, active
+                    FROM type_registry
+                    WHERE category = ?
+                    ORDER BY type_name
+                """, (category,))
+            
+            types = []
+            for row in cursor.fetchall():
+                types.append({
+                    "type_name": row[0],
+                    "category": row[1],
+                    "handler": row[2],
+                    "registered_by": row[3],
+                    "registered_at": row[4],
+                    "config": pg_sync.dejson(row[5]),
+                    "active": bool(row[6])
+                })
+            
+            return types
+    
+    def get_handler_for_type(self, type_name: str) -> Optional[str]:
+        """Get handler module path for a type"""
+        type_info = self.get_type(type_name)
+        return type_info["handler"] if type_info else None
+    
+    # === NAMESPACE REGISTRY ===
+    
+    def register_namespace(
+        self,
+        namespace: str,
+        registered_by: str,
+        description: str,
+        fields_schema: Optional[Dict[str, Any]] = None,
+        applies_to: Optional[List[str]] = None,
+        version: str = "1.0"
+    ) -> bool:
+        """Register a new meta namespace"""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute("""
+                    INSERT INTO meta_namespaces
+                    (namespace, registered_by, fields_schema, description, applies_to, version)
+                    VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
+                """, (
+                    namespace,
+                    registered_by,
+                    json.dumps(fields_schema or {}),
+                    description,
+                    json.dumps(applies_to or ["atoms"]),
+                    version
+                ))
+                
+                conn.commit()
+                self._namespace_cache.clear()  # Invalidate cache
+                logger.info(f"Registered namespace: {namespace} v{version}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Failed to register namespace {namespace}: {e}")
+                return False
+    
+    def get_namespace(self, namespace: str) -> Optional[Dict[str, Any]]:
+        """Get namespace registration"""
+        if namespace in self._namespace_cache:
+            return self._namespace_cache[namespace]
+        
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT namespace, registered_by, registered_at, fields_schema, description, applies_to, version
+                FROM meta_namespaces
+                WHERE namespace = ?
+            """, (namespace,))
+            
+            row = cursor.fetchone()
+            if not row:
+                return None
+            
+            ns_info = {
+                "namespace": row[0],
+                "registered_by": row[1],
+                "registered_at": row[2],
+                "fields_schema": pg_sync.dejson(row[3] or '{}'),
+                "description": row[4],
+                "applies_to": pg_sync.dejson(row[5]),
+                "version": row[6]
+            }
+            
+            self._namespace_cache[namespace] = ns_info
+            return ns_info
+    
+    def list_namespaces(self, applies_to: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List all registered namespaces, optionally filtered by applies_to"""
+        with self.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT namespace, registered_by, registered_at, fields_schema, description, applies_to, version
+                FROM meta_namespaces
+                ORDER BY namespace
+            """)
+            
+            namespaces = []
+            for row in cursor.fetchall():
+                applies_to_list = pg_sync.dejson(row[5])
+                
+                # Filter if requested
+                if applies_to and applies_to not in applies_to_list:
+                    continue
+                
+                namespaces.append({
+                    "namespace": row[0],
+                    "registered_by": row[1],
+                    "registered_at": row[2],
+                    "fields_schema": pg_sync.dejson(row[3] or '{}'),
+                    "description": row[4],
+                    "applies_to": applies_to_list,
+                    "version": row[6]
+                })
+            
+            return namespaces
+    
+    def validate_namespace_data(
+        self,
+        namespace: str,
+        data: Dict[str, Any]
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Validate data against namespace schema.
+        Returns (is_valid, error_message).
+        
+        Note: Currently simple check. Can be extended with JSON Schema validation.
+        """
+        ns_info = self.get_namespace(namespace)
+        if not ns_info:
+            return False, f"Namespace {namespace} not registered"
+        
+        # TODO: Add JSON Schema validation if fields_schema is provided
+        # For Phase 1, just check that it's a dict
+        if not isinstance(data, dict):
+            return False, "Data must be a dictionary"
+        
+        return True, None
+
+
+# Global service instance
+registry_service = RegistryService()
+
+
+def get_registry_service() -> RegistryService:
+    """Get registry service instance"""
+    return registry_service
