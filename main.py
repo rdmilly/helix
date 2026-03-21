@@ -46,6 +46,8 @@ from routers.tenants import tenants_router
 from routers.init import init_router
 from routers.usage import usage_router
 from routers.dashboard import dashboard_router
+from routers.auth import auth_router
+from routers.register import register_router
 from services.tenant_auth import TenantMiddleware
 from mcp_tools import mcp as helix_mcp
 from mcp_tools_action import _register_action_tools
@@ -373,6 +375,8 @@ app.include_router(tenants_router, tags=["Tenants - Layer 0"])
 app.include_router(init_router, tags=["Init - Layer 1"])
 app.include_router(usage_router, tags=["Usage - Layer 2"])
 app.include_router(dashboard_router)
+app.include_router(auth_router, tags=["Auth"])
+app.include_router(register_router)
 
 # ================================================================
 # MCP TOOLS — file ops registered here

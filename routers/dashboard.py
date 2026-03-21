@@ -113,11 +113,15 @@ _DASH_HTML = """
   </div>
 </main>
 <script>
-  const params = new URLSearchParams(window.location.search)
-  const KEY = params.get('key') || ''
-  if(!KEY){ window.location.href='/dashboard'; }
+  const TOKEN = localStorage.getItem('helix_token') || new URLSearchParams(window.location.search).get('key') || ''
+  if(!TOKEN){ window.location.href='/login'; }
 
-  function signOut(){ window.location.href='/dashboard'; }
+  function authHeaders(){
+    if(TOKEN.startsWith('hx-')) return {'X-Helix-API-Key': TOKEN}
+    return {'Authorization': 'Bearer ' + TOKEN}
+  }
+
+  function signOut(){ localStorage.removeItem('helix_token'); localStorage.removeItem('helix_tenant'); window.location.href='/login'; }
 
   function fmt(n){ return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(n) }
 
@@ -126,10 +130,10 @@ _DASH_HTML = """
     document.getElementById('content').style.display='none'
     try{
       const [u, h] = await Promise.all([
-        fetch('/api/v1/usage?days=30', {headers:{'X-Helix-API-Key':KEY}}).then(r=>r.json()),
-        fetch('/api/v1/usage/history?days=14', {headers:{'X-Helix-API-Key':KEY}}).then(r=>r.json()),
+        fetch('/api/v1/usage?days=30', {headers:authHeaders()}).then(r=>r.json()),
+        fetch('/api/v1/usage/history?days=14', {headers:authHeaders()}).then(r=>r.json()),
       ])
-      if(u.detail && u.detail.includes('401')){ window.location.href='/dashboard'; return; }
+      if(u.detail && (u.detail.includes('401') || u.detail.includes('token'))){ window.location.href='/login'; return; }
       render(u, h)
     } catch(e){
       document.getElementById('loading').textContent = 'Error loading data. Check your key and try again.'
@@ -193,7 +197,8 @@ _DASH_HTML = """
 
 @dashboard_router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
 def dashboard_login():
-    return HTMLResponse(_LOGIN_HTML)
+    # Redirect to proper login page
+    return HTMLResponse(status_code=302, headers={"Location": "/login"})
 
 
 @dashboard_router.get("/dashboard/home", response_class=HTMLResponse, include_in_schema=False)
