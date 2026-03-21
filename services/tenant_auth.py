@@ -30,6 +30,7 @@ SKIP_AUTH_PATHS = {
     "/login",
     "/api/v1/auth/register",
     "/api/v1/auth/login",
+    "/widget",
 }
 
 INTERNAL_TENANT_HEADER = "X-Helix-Tenant-ID"

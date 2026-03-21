@@ -134,6 +134,8 @@ async def ext_ingest(
             source = PLATFORM_SOURCE.get(platform, f"ext-{platform}")
             timestamp = _parse_timestamp(conv_turns[0].timestamp)
 
+            from services.content_detector import detect
+            ctype, cconf = detect(transcript)
             metadata = {
                 "extension_version": payload.extensionVersion,
                 "flushed_at": payload.flushedAt,
@@ -141,6 +143,8 @@ async def ext_ingest(
                 "turn_count": len(conv_turns),
                 "capture_types": list({t.captureType for t in conv_turns if t.captureType}),
                 "url": conv_turns[0].url,
+                "content_type": ctype,
+                "content_confidence": round(cconf, 2),
             }
 
             result = await conversation_store.ingest_conversation(

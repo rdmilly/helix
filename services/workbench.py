@@ -171,6 +171,9 @@ class WorkbenchService:
     # ================================================================
     async def scan_code(self, content: str, file_path: str = "", language: Optional[str] = None) -> Dict[str, Any]:
         """Scan code content for atoms and patterns via Forge."""
+        from services.content_detector import should_scan
+        if not should_scan(content, file_path):
+            return {"status": "skipped", "reason": "non-code content"}
         try:
             if not language:
                 ext = Path(file_path).suffix.lower() if file_path else ""

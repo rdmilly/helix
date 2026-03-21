@@ -49,6 +49,7 @@ from routers.dashboard import dashboard_router
 from routers.auth import auth_router
 from routers.register import register_router
 from services.tenant_auth import TenantMiddleware
+from routers.widget import widget_router
 from mcp_tools import mcp as helix_mcp
 from mcp_tools_action import _register_action_tools
 from mcp_mount import setup_mcp, teardown_mcp, mcp_asgi_app
@@ -377,6 +378,7 @@ app.include_router(usage_router, tags=["Usage - Layer 2"])
 app.include_router(dashboard_router)
 app.include_router(auth_router, tags=["Auth"])
 app.include_router(register_router)
+app.include_router(widget_router)
 
 # ================================================================
 # MCP TOOLS — file ops registered here

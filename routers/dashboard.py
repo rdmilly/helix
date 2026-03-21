@@ -81,6 +81,9 @@ _DASH_HTML = """
   #content{display:none}
   .refresh-btn{background:#1e1e2e;border:1px solid #334155;color:#94a3b8;border-radius:6px;padding:6px 14px;font-size:13px;cursor:pointer;float:right;margin-top:-4px}
   .refresh-btn:hover{background:#334155}
+  .live-badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#64748b;float:right;margin-top:0;margin-right:10px}
+  .live-dot{width:7px;height:7px;border-radius:50%;background:#22c55e;animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 </style></head>
 <body>
 <nav class="nav">
@@ -95,6 +98,7 @@ _DASH_HTML = """
   <div id="content">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
       <h2>Overview <span id="period-label" style="font-size:14px;font-weight:400;color:#64748b"></span></h2>
+      <span class="live-badge" id="live-badge" style="display:none"><span class="live-dot"></span><span id="last-update"></span></span>
       <button class="refresh-btn" onclick="load()">Refresh</button>
     </div>
     <div class="grid" id="stats-grid"></div>
@@ -188,9 +192,18 @@ _DASH_HTML = """
 
     document.getElementById('loading').style.display='none'
     document.getElementById('content').style.display='block'
+    const b=document.getElementById('live-badge'); b.style.display='inline-flex'
+    document.getElementById('last-update').textContent='Updated '+new Date().toLocaleTimeString()
   }
 
   load()
+
+  // Auto-refresh every 30s
+  let _poll = setInterval(load, 30000)
+  document.addEventListener('visibilitychange', () => {
+    if(document.hidden){ clearInterval(_poll) }
+    else { _poll = setInterval(load, 30000) }
+  })
 </script></body></html>
 """
 
