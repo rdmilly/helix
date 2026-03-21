@@ -51,6 +51,7 @@ from routers.register import register_router
 from services.tenant_auth import TenantMiddleware
 from mcp_tools import mcp as helix_mcp
 from mcp_tools_action import _register_action_tools
+import mcp_tools_init  # registers helix_init tool
 from mcp_mount import setup_mcp, teardown_mcp, mcp_asgi_app
 from routers.stubs import (
     flagella_router,
