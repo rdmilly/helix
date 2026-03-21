@@ -6,6 +6,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Auth deps (separate layer for cache efficiency)
+RUN pip install --no-cache-dir bcrypt==4.2.1 PyJWT==2.10.1
+
 # Copy application
 COPY . .
 
