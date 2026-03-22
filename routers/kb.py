@@ -62,7 +62,7 @@ def _index_directory(source: str, base_path: Path) -> Dict[str, int]:
                 doc_id = f"{source}:{rel_path}"
                 # Check if unchanged
                 existing = conn.execute(
-                    'SELECT content_hash FROM kb_documents WHERE id = ?', (doc_id,)
+                    'SELECT content_hash FROM kb_documents WHERE id = %s', (doc_id,)
                 ).fetchone()
                 if existing and existing['content_hash'] == content_hash:
                     skipped += 1
@@ -76,7 +76,7 @@ def _index_directory(source: str, base_path: Path) -> Dict[str, int]:
                 conn.execute(
                     '''INSERT INTO kb_documents
                        (id, source, path, title, content, content_hash, size_bytes, indexed_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
                     (doc_id, source, rel_path, title, content, content_hash,
                      len(content.encode('utf-8')),
                      datetime.now(timezone.utc).isoformat())
@@ -113,18 +113,16 @@ async def kb_search(
     try:
         if source:
             rows = conn.execute(
-                '''SELECT kb.*, rank FROM kb_documents kb
-                   JOIN kb_fts ON kb.rowid = kb_fts.rowid
-                   WHERE kb_fts MATCH ? AND kb.source = ?
-                   ORDER BY rank LIMIT ?''',
+                '''SELECT * FROM kb_documents
+                   WHERE search_vector @@ plainto_tsquery('english', %s) AND source = %s
+                   ORDER BY indexed_at DESC LIMIT %s''',
                 (q, source, limit)
             ).fetchall()
         else:
             rows = conn.execute(
-                '''SELECT kb.*, rank FROM kb_documents kb
-                   JOIN kb_fts ON kb.rowid = kb_fts.rowid
-                   WHERE kb_fts MATCH ?
-                   ORDER BY rank LIMIT ?''',
+                '''SELECT * FROM kb_documents
+                   WHERE search_vector @@ plainto_tsquery('english', %s)
+                   ORDER BY indexed_at DESC LIMIT %s''',
                 (q, limit)
             ).fetchall()
         results = []
@@ -148,9 +146,9 @@ async def get_doc(
     conn = _get_conn()
     try:
         if source:
-            row = conn.execute('SELECT * FROM kb_documents WHERE path = ? AND source = ?', (path, source)).fetchone()
+            row = conn.execute('SELECT * FROM kb_documents WHERE path = %s AND source = %s', (path, source)).fetchone()
         else:
-            row = conn.execute('SELECT * FROM kb_documents WHERE path = ?', (path,)).fetchone()
+            row = conn.execute('SELECT * FROM kb_documents WHERE path = %s', (path,)).fetchone()
         if not row:
             return {"error": "not found", "path": path}
         return dict(row)
@@ -186,7 +184,7 @@ async def index_single_file(req: IndexFileRequest):
         conn.execute(
             '''INSERT INTO kb_documents
                (id, source, path, title, content, content_hash, size_bytes, indexed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
             (doc_id, req.source, req.path, title, content, content_hash,
              len(content.encode('utf-8')),
              datetime.now(timezone.utc).isoformat())

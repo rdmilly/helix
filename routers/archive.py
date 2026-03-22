@@ -16,6 +16,7 @@ from services import pg_sync
 import logging
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Query
+from pydantic import BaseModel
 from services.database import get_db_path
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,40 @@ def _row_to_dict(row) -> Dict:
             d['metadata'] = {}
         del d['metadata_json']
     return d
+
+class ArchiveRecord(BaseModel):
+    collection: str
+    content: str
+    session_id: str = "claude"
+    metadata: dict = {}
+
+@router.post("/record")
+async def record_entry(data: ArchiveRecord):
+    """Write a new entry to the structured archive."""
+    import uuid
+    from datetime import datetime, timezone
+    valid = {"decisions", "failures", "patterns", "sessions", "project_archive", "snapshots"}
+    if data.collection not in valid:
+        from fastapi import HTTPException
+        raise HTTPException(400, f"Invalid collection. Must be one of: {', '.join(sorted(valid))}")
+    conn = _get_conn()
+    try:
+        entry_id = uuid.uuid4().hex[:12]
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """INSERT INTO structured_archive (id, collection, content, metadata_json, session_id, timestamp, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (entry_id, data.collection, data.content, json.dumps(data.metadata), data.session_id, now, now)
+        )
+        conn.commit()
+        try:
+            from services.event_bus import publish
+            publish("archive.recorded", {"collection": data.collection, "entry_id": entry_id})
+        except Exception:
+            pass
+        return {"status": "recorded", "id": entry_id, "collection": data.collection, "size": len(data.content)}
+    finally:
+        conn.close()
 
 @router.get("/stats")
 async def archive_stats():
@@ -58,15 +93,15 @@ async def search_archive(
         if collection:
             rows = conn.execute(
                 '''SELECT sa.* FROM structured_archive sa
-                   WHERE sa.search_vector @@ plainto_tsquery('english', ?) AND sa.collection = ?
-                   ORDER BY sa.timestamp DESC LIMIT ?''',
+                   WHERE sa.search_vector @@ plainto_tsquery('english', %s) AND sa.collection = %s
+                   ORDER BY sa.timestamp DESC LIMIT %s''',
                 (q, collection, limit)
             ).fetchall()
         else:
             rows = conn.execute(
                 '''SELECT sa.* FROM structured_archive sa
-                   WHERE sa.search_vector @@ plainto_tsquery('english', ?)
-                   ORDER BY sa.timestamp DESC LIMIT ?''',
+                   WHERE sa.search_vector @@ plainto_tsquery('english', %s)
+                   ORDER BY sa.timestamp DESC LIMIT %s''',
                 (q, limit)
             ).fetchall()
         results = [_row_to_dict(r) for r in rows]
@@ -79,10 +114,9 @@ async def search_decisions(q: str = Query(...), limit: int = Query(20, ge=1, le=
     conn = _get_conn()
     try:
         rows = conn.execute(
-            '''SELECT sa.*, rank FROM structured_archive sa
-               JOIN structured_fts ON sa.rowid = structured_fts.rowid
-               WHERE structured_fts MATCH ? AND sa.collection = 'decisions'
-               ORDER BY rank LIMIT ?''',
+            '''SELECT * FROM structured_archive
+               WHERE search_vector @@ plainto_tsquery('english', %s) AND collection = 'decisions'
+               ORDER BY created_at DESC LIMIT %s''',
             (q, limit)
         ).fetchall()
         return {"query": q, "count": len(rows), "results": [_row_to_dict(r) for r in rows]}
@@ -94,10 +128,9 @@ async def search_failures(q: str = Query(...), limit: int = Query(20, ge=1, le=1
     conn = _get_conn()
     try:
         rows = conn.execute(
-            '''SELECT sa.*, rank FROM structured_archive sa
-               JOIN structured_fts ON sa.rowid = structured_fts.rowid
-               WHERE structured_fts MATCH ? AND sa.collection = 'failures'
-               ORDER BY rank LIMIT ?''',
+            '''SELECT * FROM structured_archive
+               WHERE search_vector @@ plainto_tsquery('english', %s) AND collection = 'failures'
+               ORDER BY created_at DESC LIMIT %s''',
             (q, limit)
         ).fetchall()
         return {"query": q, "count": len(rows), "results": [_row_to_dict(r) for r in rows]}
@@ -109,10 +142,9 @@ async def search_patterns(q: str = Query(...), limit: int = Query(20, ge=1, le=1
     conn = _get_conn()
     try:
         rows = conn.execute(
-            '''SELECT sa.*, rank FROM structured_archive sa
-               JOIN structured_fts ON sa.rowid = structured_fts.rowid
-               WHERE structured_fts MATCH ? AND sa.collection = 'patterns'
-               ORDER BY rank LIMIT ?''',
+            '''SELECT * FROM structured_archive
+               WHERE search_vector @@ plainto_tsquery('english', %s) AND collection = 'patterns'
+               ORDER BY created_at DESC LIMIT %s''',
             (q, limit)
         ).fetchall()
         return {"query": q, "count": len(rows), "results": [_row_to_dict(r) for r in rows]}
@@ -124,10 +156,9 @@ async def search_sessions(q: str = Query(...), limit: int = Query(20, ge=1, le=1
     conn = _get_conn()
     try:
         rows = conn.execute(
-            '''SELECT sa.*, rank FROM structured_archive sa
-               JOIN structured_fts ON sa.rowid = structured_fts.rowid
-               WHERE structured_fts MATCH ? AND sa.collection = 'sessions'
-               ORDER BY rank LIMIT ?''',
+            '''SELECT * FROM structured_archive
+               WHERE search_vector @@ plainto_tsquery('english', %s) AND collection = 'sessions'
+               ORDER BY created_at DESC LIMIT %s''',
             (q, limit)
         ).fetchall()
         return {"query": q, "count": len(rows), "results": [_row_to_dict(r) for r in rows]}
@@ -143,12 +174,12 @@ async def recent_entries(
     try:
         if collection:
             rows = conn.execute(
-                'SELECT * FROM structured_archive WHERE collection = ? ORDER BY timestamp DESC LIMIT ?',
+                'SELECT * FROM structured_archive WHERE collection = %s ORDER BY timestamp DESC LIMIT %s',
                 (collection, limit)
             ).fetchall()
         else:
             rows = conn.execute(
-                'SELECT * FROM structured_archive ORDER BY timestamp DESC LIMIT ?',
+                'SELECT * FROM structured_archive ORDER BY timestamp DESC LIMIT %s',
                 (limit,)
             ).fetchall()
         return {"collection": collection, "count": len(rows), "results": [_row_to_dict(r) for r in rows]}

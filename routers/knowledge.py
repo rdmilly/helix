@@ -87,15 +87,15 @@ async def upsert_entity(data: EntityUpsert):
     conn = _get_conn()
     try:
         now = _now()
-        existing = conn.execute("SELECT id FROM entities WHERE name = ?", (data.name,)).fetchone()
+        existing = conn.execute("SELECT id FROM entities WHERE name = %s", (data.name,)).fetchone()
         if existing:
-            conn.execute("UPDATE entities SET entity_type = COALESCE(?, entity_type), description = COALESCE(?, description), attributes_json = ?, last_seen = ?, mention_count = COALESCE(mention_count, 0) + 1 WHERE name = ?",
+            conn.execute("UPDATE entities SET entity_type = COALESCE(?, entity_type), description = COALESCE(?, description), attributes_json = ?, last_seen = ?, mention_count = COALESCE(mention_count, 0) + 1 WHERE name = %s",
                 (data.entity_type, data.description, json.dumps(data.attributes), now, data.name))
             conn.commit(); _rebuild_fts(conn)
             result = {"status": "updated", "name": data.name}
         else:
             eid = hashlib.sha256(f"{data.name}:{data.entity_type}".encode()).hexdigest()[:12]
-            conn.execute("INSERT INTO entities (id, name, entity_type, description, attributes_json, first_seen, last_seen, meta, mention_count) VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 1) ON CONFLICT DO NOTHING",
+            conn.execute("INSERT INTO entities (id, name, entity_type, description, attributes_json, first_seen, last_seen, meta, mention_count) VALUES (%s, %s, %s, %s, %s, %s, %s, '{}', 1) ON CONFLICT DO NOTHING",
                 (eid, data.name, data.entity_type, data.description, json.dumps(data.attributes), now, now))
             conn.commit(); _rebuild_fts(conn)
             result = {"status": "created", "name": data.name, "id": eid}
@@ -118,7 +118,7 @@ async def upsert_entity(data: EntityUpsert):
 async def get_entity(name: str):
     conn = _get_conn()
     try:
-        row = conn.execute("SELECT * FROM entities WHERE name = ?", (name,)).fetchone()
+        row = conn.execute("SELECT * FROM entities WHERE name = %s", (name,)).fetchone()
         if not row: raise HTTPException(404, f"Entity '{name}' not found")
         return _entity_to_dict(row)
     finally:
@@ -128,11 +128,11 @@ async def get_entity(name: str):
 async def delete_entity(name: str):
     conn = _get_conn()
     try:
-        row = conn.execute("SELECT id FROM entities WHERE name = ?", (name,)).fetchone()
+        row = conn.execute("SELECT id FROM entities WHERE name = %s", (name,)).fetchone()
         if not row: raise HTTPException(404, f"Entity '{name}' not found")
-        conn.execute("DELETE FROM entities WHERE name = ?", (name,))
-        conn.execute("DELETE FROM kg_relationships WHERE source_name = ? OR target_name = ?", (name, name))
-        conn.execute("DELETE FROM kg_mentions WHERE entity_name = ?", (name,))
+        conn.execute("DELETE FROM entities WHERE name = %s", (name,))
+        conn.execute("DELETE FROM kg_relationships WHERE source_name = %s OR target_name = ?", (name, name))
+        conn.execute("DELETE FROM kg_mentions WHERE entity_name = %s", (name,))
         conn.commit(); _rebuild_fts(conn)
         return {"status": "deleted", "name": name}
     finally:
@@ -144,13 +144,20 @@ async def search_entities(q: str = Query(""), entity_type: str = Query(""), limi
     try:
         if q:
             try:
-                rows = conn.execute("SELECT e.* FROM entities e JOIN entity_fts f ON e.rowid = f.rowid WHERE entity_fts MATCH ? ORDER BY rank LIMIT ?", (q, limit)).fetchall()
-            except:
-                rows = conn.execute("SELECT * FROM entities WHERE name LIKE ? OR description LIKE ? LIMIT ?", (f"%{q}%", f"%{q}%", limit)).fetchall()
+                rows = conn.execute(
+                    "SELECT * FROM entities WHERE to_tsvector('english', coalesce(name,'') || ' ' || coalesce(description,'')) @@ plainto_tsquery('english', %s) ORDER BY mention_count DESC LIMIT %s",
+                    (q, limit)
+                ).fetchall()
+            except Exception:
+                conn._c.rollback()
+                rows = conn.execute(
+                    "SELECT * FROM entities WHERE name ILIKE %s OR description ILIKE %s LIMIT %s",
+                    (f"%{q}%", f"%{q}%", limit)
+                ).fetchall()
         elif entity_type:
-            rows = conn.execute("SELECT * FROM entities WHERE entity_type = ? ORDER BY mention_count DESC LIMIT ?", (entity_type, limit)).fetchall()
+            rows = conn.execute("SELECT * FROM entities WHERE entity_type = %s ORDER BY mention_count DESC LIMIT %s", (entity_type, limit)).fetchall()
         else:
-            rows = conn.execute("SELECT * FROM entities ORDER BY mention_count DESC LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute("SELECT * FROM entities ORDER BY mention_count DESC LIMIT %s", (limit,)).fetchall()
         return {"results": [_entity_to_dict(r) for r in rows], "count": len(rows)}
     finally:
         conn.close()
@@ -159,11 +166,11 @@ async def search_entities(q: str = Query(""), entity_type: str = Query(""), limi
 async def get_graph(name: str):
     conn = _get_conn()
     try:
-        entity = conn.execute("SELECT * FROM entities WHERE name = ?", (name,)).fetchone()
+        entity = conn.execute("SELECT * FROM entities WHERE name = %s", (name,)).fetchone()
         if not entity: raise HTTPException(404, f"Entity '{name}' not found")
-        outgoing = conn.execute("SELECT target_name, relation_type, description FROM kg_relationships WHERE source_name = ?", (name,)).fetchall()
-        incoming = conn.execute("SELECT source_name, relation_type, description FROM kg_relationships WHERE target_name = ?", (name,)).fetchall()
-        mentions = conn.execute("SELECT session_id, context, mentioned_at FROM kg_mentions WHERE entity_name = ? ORDER BY mentioned_at DESC LIMIT 10", (name,)).fetchall()
+        outgoing = conn.execute("SELECT target_name, relation_type, description FROM kg_relationships WHERE source_name = %s", (name,)).fetchall()
+        incoming = conn.execute("SELECT source_name, relation_type, description FROM kg_relationships WHERE target_name = %s", (name,)).fetchall()
+        mentions = conn.execute("SELECT session_id, context, mentioned_at FROM kg_mentions WHERE entity_name = %s ORDER BY mentioned_at DESC LIMIT 10", (name,)).fetchall()
         return {"entity": _entity_to_dict(entity), "outgoing": [dict(r) for r in outgoing], "incoming": [dict(r) for r in incoming], "recent_mentions": [dict(r) for r in mentions]}
     finally:
         conn.close()
@@ -172,7 +179,7 @@ async def get_graph(name: str):
 async def add_relationship(data: RelationshipCreate):
     conn = _get_conn()
     try:
-        conn.execute("INSERT INTO kg_relationships (source_name, target_name, relation_type, description, session_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        conn.execute("INSERT INTO kg_relationships (source_name, target_name, relation_type, description, session_id, created_at) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (source_name, target_name, relation_type) DO UPDATE SET description = EXCLUDED.description, session_id = EXCLUDED.session_id, created_at = EXCLUDED.created_at",
             (data.source, data.target, data.relation_type, data.description, data.session_id, _now()))
         conn.commit()
         return {"status": "created", "source": data.source, "target": data.target, "type": data.relation_type}
@@ -183,8 +190,8 @@ async def add_relationship(data: RelationshipCreate):
 async def record_mention(data: MentionCreate):
     conn = _get_conn()
     try:
-        conn.execute("INSERT INTO kg_mentions (entity_name, session_id, context, mentioned_at) VALUES (?, ?, ?, ?)", (data.entity_name, data.session_id, data.context, _now()))
-        conn.execute("UPDATE entities SET mention_count = COALESCE(mention_count, 0) + 1, last_seen = ? WHERE name = ?", (_now(), data.entity_name))
+        conn.execute("INSERT INTO kg_mentions (entity_name, session_id, context, mentioned_at) VALUES (%s, %s, %s, %s)", (data.entity_name, data.session_id, data.context, _now()))
+        conn.execute("UPDATE entities SET mention_count = COALESCE(mention_count, 0) + 1, last_seen = ? WHERE name = %s", (_now(), data.entity_name))
         conn.commit()
         return {"status": "recorded", "entity": data.entity_name}
     finally:
@@ -213,7 +220,7 @@ async def bulk_migrate(data: BulkMigrate):
         for e in data.entities:
             try:
                 eid = e.get("id") or hashlib.sha256(f"{e['name']}:{e.get('entity_type','')}".encode()).hexdigest()[:12]
-                conn.execute("INSERT INTO entities (id, name, entity_type, description, attributes_json, first_seen, last_seen, meta, mention_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                conn.execute("INSERT INTO entities (id, name, entity_type, description, attributes_json, first_seen, last_seen, meta, mention_count) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (eid, e["name"], e.get("entity_type", "concept"), e.get("description", ""), json.dumps(e.get("attributes", {})), e.get("first_seen", _now()), e.get("last_seen", _now()), json.dumps(e.get("meta", {})), e.get("mention_count", 0)))
                 e_ok += 1
             except Exception as ex:
@@ -221,7 +228,7 @@ async def bulk_migrate(data: BulkMigrate):
         r_ok = 0
         for r in data.relationships:
             try:
-                conn.execute("INSERT INTO kg_relationships (source_name, target_name, relation_type, description, session_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                conn.execute("INSERT INTO kg_relationships (source_name, target_name, relation_type, description, session_id, created_at) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (source_name, target_name, relation_type) DO UPDATE SET description = EXCLUDED.description, session_id = EXCLUDED.session_id, created_at = EXCLUDED.created_at",
                     (r["source_name"], r["target_name"], r.get("relation_type", "related_to"), r.get("description", ""), r.get("session_id", ""), r.get("created_at", _now())))
                 r_ok += 1
             except Exception as ex:
@@ -229,7 +236,7 @@ async def bulk_migrate(data: BulkMigrate):
         m_ok = 0
         for m in data.mentions:
             try:
-                conn.execute("INSERT INTO kg_mentions (entity_name, session_id, context, mentioned_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                conn.execute("INSERT INTO kg_mentions (entity_name, session_id, context, mentioned_at) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
                     (m["entity_name"], m.get("session_id", ""), m.get("context", ""), m.get("mentioned_at", _now())))
                 m_ok += 1
             except Exception as ex:

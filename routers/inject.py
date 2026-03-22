@@ -141,7 +141,29 @@ def _extract_waiting(daily: str) -> list[str]:
     return items
 
 
+def _extract_session_state(handoff: str) -> dict:
+    """Parse the SESSION_STATE gate block from top of handoff.md."""
+    state = {}
+    in_gate = False
+    for line in handoff.splitlines():
+        if line.strip() == '---' and not in_gate:
+            in_gate = True
+            continue
+        if line.strip() == '---' and in_gate:
+            break
+        if in_gate and ':' in line:
+            k, _, v = line.partition(':')
+            state[k.strip()] = v.strip()
+    return state
+
+
 def _extract_handoff_summary(handoff: str) -> str:
+    # Check for session state gate first
+    state = _extract_session_state(handoff)
+    if state.get('NEXT'):
+        prefix = f"[{state.get('SESSION_STATE','active').upper()}] Next: {state['NEXT']} | "
+    else:
+        prefix = ''
     lines = handoff.splitlines()
     summary_parts = []
     capturing = False
@@ -157,7 +179,7 @@ def _extract_handoff_summary(handoff: str) -> str:
                 summary_parts.append(stripped)
                 if len(" ".join(summary_parts)) > 200:
                     break
-    text = " ".join(summary_parts)
+    text = prefix + " ".join(summary_parts)
     if len(text) > 250:
         text = text[:247] + "..."
     return text

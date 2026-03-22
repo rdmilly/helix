@@ -42,6 +42,7 @@ services:
       - ./mcp_tools_action.py:/app/mcp_tools_action.py
       - ./secrets:/secrets:ro
       - /opt/projects:/opt/projects
+      - /var/run/docker.sock:/var/run/docker.sock:ro
       - /opt/data/working-kb:/app/working-kb:rw
     env_file:
       - .env

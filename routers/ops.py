@@ -35,28 +35,33 @@ async def trigger_retention(req: RetentionRequest = RetentionRequest()):
 
 @router.get("/diagnostics")
 async def diagnostics():
-    conn = pg_sync.sqlite_conn(str(get_db_path()), timeout=10)
-    
+    # Use sqlite3 directly — sqlite_master is SQLite-only syntax,
+    # pg_sync routes through psycopg2 and breaks on it.
+    conn = sqlite3.connect(str(get_db_path()), timeout=10)
+    conn.row_factory = sqlite3.Row
     tables = {}
-    for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
-        name = row['name']
-        try:
-            count = conn.execute(f"SELECT COUNT(*) FROM [{name}]").fetchone()[0]
-            tables[name] = count
-        except:
-            tables[name] = "error"
-    
+    try:
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
+            name = row['name']
+            try:
+                count = conn.execute(f"SELECT COUNT(*) FROM [{name}]").fetchone()[0]
+                tables[name] = count
+            except:
+                tables[name] = "error"
+    finally:
+        conn.close()
+
     # DB file sizes
     db_sizes = {}
     for f in DATA_DIR.glob("*.db*"):
         db_sizes[f.name] = round(f.stat().st_size / 1024 / 1024, 2)
-    
+
     # Backup count
     backup_dir = DATA_DIR / "backups"
     backup_count = len(list(backup_dir.iterdir())) if backup_dir.exists() else 0
-    
-    conn.close()
+
     return {
+        "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "tables": tables,
         "db_sizes_mb": db_sizes,
@@ -68,7 +73,8 @@ async def diagnostics():
 @router.post("/vacuum")
 async def vacuum_db(background_tasks: BackgroundTasks):
     def _vacuum():
-        conn = pg_sync.sqlite_conn(str(get_db_path()), timeout=60)
+        # Use sqlite3 directly — VACUUM is SQLite-only
+        conn = sqlite3.connect(str(get_db_path()), timeout=60)
         before = os.path.getsize(str(get_db_path()))
         conn.execute("VACUUM")
         conn.close()

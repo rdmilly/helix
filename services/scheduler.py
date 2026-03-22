@@ -182,34 +182,51 @@ async def job_decay_stale_patterns():
 
 
 async def job_db_backup():
-    """Backup cortex.db to the backups directory."""
-    import shutil
+    """Backup SQLite databases (cortex.db + conversations_fts.db) to the backups directory.
+
+    Uses sqlite3 directly — pg_sync wraps psycopg2 which does not support
+    the SQLite-only VACUUM INTO syntax.
+    """
+    import sqlite3
     import os
     from pathlib import Path
-    from config import DB_PATH
+    from config import DB_PATH, FTS_DB_PATH
 
     backup_dir = DB_PATH.parent / "backups"
     backup_dir.mkdir(exist_ok=True)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    backup_path = backup_dir / f"cortex-{timestamp}.db"
+    results = []
 
-    # SQLite online backup via VACUUM INTO
-    import sqlite3
-    conn = pg_sync.sqlite_conn(str(DB_PATH))
-    try:
-        conn.execute(f"VACUUM INTO '{backup_path}'")
-        size = os.path.getsize(str(backup_path))
+    for db_path, label in [(DB_PATH, "cortex"), (FTS_DB_PATH, "fts")]:
+        if not db_path.exists():
+            log.warning(f"db_backup: {db_path} not found, skipping")
+            continue
+        backup_path = backup_dir / f"{label}-{timestamp}.db"
+        try:
+            # Use sqlite3 directly — NOT pg_sync which routes through psycopg2
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute(f"VACUUM INTO '{backup_path}'")
+                conn.commit()
+            finally:
+                conn.close()
+            size_mb = os.path.getsize(str(backup_path)) / 1024 / 1024
+            results.append(f"{label}={size_mb:.1f}MB")
+            log.info(f"db_backup: {label} -> {backup_path.name} ({size_mb:.1f}MB)")
+        except Exception as e:
+            log.error(f"db_backup: failed to back up {label}: {e}")
+            results.append(f"{label}=ERROR({e})")
 
-        # Prune old backups (keep last 10)
-        backups = sorted(backup_dir.glob("cortex-*.db"))
-        while len(backups) > 10:
-            oldest = backups.pop(0)
+    # Prune old backups — keep last 10 of each type
+    for label in ["cortex", "fts"]:
+        old = sorted(backup_dir.glob(f"{label}-*.db"))
+        while len(old) > 10:
+            oldest = old.pop(0)
             oldest.unlink()
+            log.info(f"db_backup: pruned {oldest.name}")
 
-        return f"backed up {size/1024/1024:.1f}MB to {backup_path.name}"
-    finally:
-        conn.close()
+    return "backed up: " + ", ".join(results)
 
 
 async def job_promote_phrases():
@@ -222,6 +239,20 @@ async def job_promote_phrases():
     except Exception as e:
         log.error(f"Phrase promotion failed: {e}")
         return f"error: {e}"
+
+
+async def job_file_scanner():
+    """Walk /opt/projects, hash-index files, send new/changed to Forge for atom extraction."""
+    from services.file_scanner import trigger_scan
+    result = await trigger_scan()
+    return (
+        f"scanned={result.get('scanned',0)} "
+        f"new={result.get('new',0)} "
+        f"changed={result.get('changed',0)} "
+        f"unchanged={result.get('skipped_unchanged',0)} "
+        f"atoms={result.get('atoms_created',0)} "
+        f"duration={result.get('duration_s',0)}s"
+    )
 
 
 def register_default_jobs(scheduler: SchedulerService):
@@ -258,4 +289,45 @@ def register_default_jobs(scheduler: SchedulerService):
         initial_delay=900,        # 15 min after startup
     )
 
+    # File scanner: every 4 hours, first run after 2 min
+    # Walks /opt/projects, hash-indexes files, sends new/changed to Forge
+    scheduler.register(
+        "file_scanner",
+        job_file_scanner,
+        interval_seconds=14400,  # 4 hours
+        initial_delay=120,       # 2 min after startup — run early to populate atoms
+    )
+
+    # Haiku reconciler: hourly, first run after 3 min
+    scheduler.register(
+        "haiku_reconciler",
+        job_haiku_reconciler,
+        interval_seconds=3600,  # 1 hour
+        initial_delay=180,      # 3 min after startup
+    )
+
+    scheduler.register(
+        "conversation_ingester",
+        job_conversation_ingester,
+        interval_seconds=300,   # 5 min
+        initial_delay=60,       # 1 min after startup
+    )
+
     log.info(f"Registered {len(scheduler.jobs)} default jobs")
+
+
+async def job_haiku_reconciler():
+    """Run Haiku reconciler: extract decisions/patterns/failures from recent archive entries."""
+    from services.reconciler import run_reconciler
+    result = await run_reconciler()
+    return (f"processed={result['processed']} decisions={result['decisions']} "
+            f"patterns={result['patterns']} failures={result['failures']} "
+            f"errors={result['errors']} skipped={result['skipped']}")
+
+
+async def job_conversation_ingester():
+    """Sync new FTS conversation chunks into Postgres sessions (5min)."""
+    from services.ingester import run_ingester
+    import asyncio
+    result = await asyncio.get_event_loop().run_in_executor(None, run_ingester)
+    return f"new={result['new_sessions']} skipped={result['skipped']} errors={result['errors']}"

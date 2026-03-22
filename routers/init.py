@@ -15,6 +15,7 @@ import logging
 import socket
 from typing import Optional
 from fastapi import APIRouter, Request, HTTPException
+from fastapi.responses import JSONResponse, RedirectResponse, FileResponse
 from pydantic import BaseModel
 from services import pg_sync
 from services.tenant_auth import generate_api_key
@@ -119,6 +120,56 @@ def helix_init(body: InitRequest, request: Request):
             "5. Verify: ask Claude to run node_status()",
         ]
     }
+
+
+@init_router.get("/init/my-key")
+async def get_my_key(request: Request):
+    """Return the tenant's active API key for display in the dashboard.
+    Requires JWT cookie auth.
+    """
+    from services.auth_service import get_session
+    from services.pg_sync import get_pg_conn
+    import hashlib, secrets
+
+    session = get_session(request)
+    if not session:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": "unauthenticated"}, status_code=401)
+
+    tenant_id = session.get("tid")
+    try:
+        with get_pg_conn(admin=True) as conn:
+            row = conn.execute(
+                "SELECT key_hash, name FROM api_keys WHERE tenant_id=%s AND status='active' ORDER BY created_at LIMIT 1",
+                (tenant_id,)
+            ).fetchone()
+
+        if row:
+            # Key hash exists but we can't recover the raw key.
+            # Issue a fresh one and update the record.
+            raw = "hx-" + secrets.token_urlsafe(32)
+            key_hash = hashlib.sha256(raw.encode()).hexdigest()
+            with get_pg_conn(admin=True) as conn:
+                conn.execute(
+                    "UPDATE api_keys SET key_hash=%s WHERE tenant_id=%s AND status='active'",
+                    (key_hash, tenant_id)
+                )
+                conn.commit()
+        else:
+            # No key yet, create one
+            raw = "hx-" + secrets.token_urlsafe(32)
+            key_hash = hashlib.sha256(raw.encode()).hexdigest()
+            with get_pg_conn(admin=True) as conn:
+                conn.execute(
+                    "INSERT INTO api_keys (tenant_id, key_hash, name) VALUES (%s,%s,'default')",
+                    (tenant_id, key_hash)
+                )
+                conn.commit()
+
+        return JSONResponse({"api_key": raw})
+    except Exception as e:
+        logger.error(f"my-key error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @init_router.get("/init/agent")

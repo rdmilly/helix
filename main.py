@@ -39,6 +39,8 @@ from routers.ext_ingest import router as ext_ingest_router
 from routers.membrain_vector import router as membrain_vector_router
 from routers.proxy import proxy_router
 from routers.ops import router as ops_router
+from routers.master_status import router as master_status_router
+from routers.assemble import router as assemble_router
 from routers.action import router as action_router
 from routers.nodes import router as nodes_router
 from services.exchange import ensure_tables as ensure_exchange_tables
@@ -50,9 +52,8 @@ from routers.auth import auth_router
 from routers.register import register_router
 from services.tenant_auth import TenantMiddleware
 from routers.widget import widget_router
-from mcp_tools import mcp as helix_mcp
-from mcp_tools_action import _register_action_tools
-from mcp_mount import setup_mcp, teardown_mcp, mcp_asgi_app
+# MCP endpoint removed — helix-mcp (port 9096) is now the single MCP surface.
+# helix-mcp proxies all tool calls to cortex REST. cortex no longer exposes /mcp.
 from routers.stubs import (
     flagella_router,
 )
@@ -149,8 +150,9 @@ async def lifespan(app: FastAPI):
 
     # Scheduler
     try:
-        from services.scheduler import get_scheduler
+        from services.scheduler import get_scheduler, register_default_jobs
         scheduler = get_scheduler()
+        register_default_jobs(scheduler)
         await scheduler.start()
         log.info("Scheduler started")
     except Exception as e:
@@ -165,12 +167,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning(f"Worker failed to start: {e}")
 
-    # MCP setup
-    try:
-        await setup_mcp()
-        log.info("MCP StreamableHTTP mounted at /mcp")
-    except Exception as e:
-        log.warning(f"MCP setup failed: {e}")
+    # MCP endpoint disabled — helix-mcp handles all MCP traffic
 
     log.info(f"Helix Cortex v0.9.0 ready on port 9050")
 
@@ -194,10 +191,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
-    try:
-        await teardown_mcp()
-    except Exception:
-        pass
+    # teardown_mcp removed
 
     try:
         from services.workbench import get_workbench
@@ -359,6 +353,8 @@ app.include_router(archive_router, tags=["Structured Archive"])
 app.include_router(kb_router, tags=["KB Unification"])
 app.include_router(backup_router, tags=["Backup & Restore"])
 app.include_router(ops_router, tags=["Operations"])
+app.include_router(master_status_router, tags=["Master Status"])
+app.include_router(assemble_router, tags=["Assembler"])
 app.include_router(action_router, tags=["helix_action"])
 app.include_router(nodes_router, tags=["Nodes"])
 app.include_router(flagella_router, tags=["Flagella - Phase 7b"])
@@ -380,13 +376,15 @@ app.include_router(auth_router, tags=["Auth"])
 app.include_router(register_router)
 app.include_router(widget_router)
 
-# ================================================================
-# MCP TOOLS — file ops registered here
-# ================================================================
-_register_action_tools(helix_mcp)
+# New proper auth system
+from routers.login import login_router
+from routers.auth_google import auth_google_router
+from routers.auth_email import auth_email_router
+app.include_router(login_router)
+app.include_router(auth_google_router, tags=["Auth - Google OAuth"])
+app.include_router(auth_email_router, tags=["Auth - Email/Password"])
 
-# Mount MCP ASGI app
-app.mount("/mcp", mcp_asgi_app)
+# MCP mount removed — see helix-mcp service (port 9096)
 
 
 if __name__ == "__main__":
