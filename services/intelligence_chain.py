@@ -140,6 +140,67 @@ def append_journal_entry(date_str: str, session_id: str, decisions: list, patter
         log.error(f"append_journal: {e}")
         return False
 
+def write_file_journal_entry(path: str, session_id: str, context: str = '', git_result: dict = None) -> bool:
+    """Write a structured journal entry for a file edit.
+    
+    Called by file.written pipeline to document every real code change
+    as a public engineering journal entry.
+    """
+    try:
+        from pathlib import Path as _Path
+        from datetime import datetime, timezone
+        
+        JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        time_str = datetime.now(timezone.utc).strftime('%H:%M UTC')
+        rel_path = path
+        # Try to make path relative to known roots
+        for root in ['/opt/projects/memory-ext/', '/opt/projects/helix/', '/opt/projects/']:
+            if path.startswith(root):
+                rel_path = path[len(root):]
+                break
+        
+        commit_info = ''
+        if git_result and git_result.get('status') == 'committed':
+            msg = git_result.get('commit_msg', '')
+            pushed = '↑ pushed' if git_result.get('pushed') else 'local only'
+            commit_info = f'
+- git: {msg} ({pushed})'
+        
+        lines = [
+            f'
+---
+',
+            f'## {date_str} {time_str} — {rel_path}',
+        ]
+        if context:
+            lines.append(f'- {context}')
+        lines.append(f'- file: `{rel_path}`')
+        if commit_info:
+            lines.append(commit_info.strip())
+        lines.append(f'- session: {session_id[:12]}')
+        
+        entry = '
+'.join(lines) + '
+'
+        with open(JOURNAL_PATH, 'r+', encoding='utf-8') as f:
+            existing = f.read()
+            # Insert after the header line
+            header_end = existing.find('
+', existing.find('_Auto-appended')) + 1
+            if header_end > 0:
+                f.seek(header_end)
+                rest = existing[header_end:]
+                f.write(entry + rest)
+            else:
+                f.seek(0, 2)  # append
+                f.write(entry)
+        return True
+    except Exception as e:
+        log.error(f"write_file_journal: {e}")
+        return False
+
+
 
 # ── Main chain runner ─────────────────────────────────────────────────────
 

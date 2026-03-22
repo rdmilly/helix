@@ -3,6 +3,7 @@
 GET /api/v1/master/status - Full system snapshot for the helixmaster dashboard.
 Called by fetchLiveData() on page load and refresh button.
 """
+import re
 import time
 import sqlite3
 import logging
@@ -21,6 +22,7 @@ router = APIRouter(prefix="/api/v1/master")
 _START_TIME = time.time()
 DATA_DIR = Path("/app/data")
 FTS_DB = DATA_DIR / "conversations_fts.db"
+JOURNAL_PATH = Path('/app/working-kb/journal.md')
 
 
 def _uptime_str() -> str:
@@ -61,6 +63,73 @@ def _container_count() -> int:
     except Exception as e:
         log.debug(f"container_count: {e}")
         return 0
+
+
+def _is_ts(s: str) -> bool:
+    """Return True if string looks like a raw timestamp, not human text."""
+    return bool(re.match(r'^\d{4}-\d{2}-\d{2}[T \d]', s.strip()))
+
+
+def _parse_journal_md(max_entries: int = 20) -> list:
+    """Parse journal.md into structured entries for helixmaster.
+
+    Handles two formats:
+      - Manual entries: body bullets + ### Decisions section
+      - Reconciler auto-entries: ### Decisions only
+    Skips raw timestamp lines that appear when reconciler has no real content.
+    """
+    entries = []
+    try:
+        if not JOURNAL_PATH.exists():
+            return entries
+        text = JOURNAL_PATH.read_text(encoding='utf-8')
+        sections = text.split('\n## ')
+        for section in sections[1:]:
+            if len(entries) >= max_entries:
+                break
+            lines = section.strip().split('\n')
+            if not lines:
+                continue
+            header = lines[0].strip()
+            date_str = header[:10] if len(header) >= 10 else '?'
+            session = ''
+            if ' \u2014 session ' in header:
+                session = header.split(' \u2014 session ')[-1].strip()[:12]
+            elif ' \u2014 ' in header:
+                session = header.split(' \u2014 ', 1)[-1].strip()[:60]
+            decisions, body_lines = [], []
+            in_dec = False
+            for line in lines[1:]:
+                if line.startswith('### Decisions'):
+                    in_dec = True
+                elif line.startswith('###'):
+                    in_dec = False
+                elif line.startswith('- '):
+                    val = line[2:].strip()
+                    if _is_ts(val):
+                        continue  # skip raw timestamp lines
+                    if in_dec:
+                        decisions.append({'text': val, 'status': 'live'})
+                    else:
+                        body_lines.append(val)
+            title = next((l for l in body_lines if l and not _is_ts(l)), session or header)
+            body = '\n'.join(body_lines[:10])
+            glance = body_lines[-1] if body_lines else ''
+            if not body and not decisions:
+                continue  # skip empty entries
+            entries.append({
+                'date': date_str,
+                'session': session[:40],
+                'title': title[:120],
+                'body': body[:800],
+                'decisions': decisions[:8],
+                'build_plan': [],
+                'glance': glance[:200],
+                'tags': list(set([date_str[:7]] + ([session[:12]] if session else []))),
+            })
+    except Exception as e:
+        log.warning(f"journal parse failed: {e}")
+    return entries
 
 
 @router.get("/status")
@@ -109,10 +178,10 @@ async def master_status():
             cl = (content or '').lower()
             group = 'General'
             if any(k in cl for k in ['mcp', 'provisioner', 'manifest', 'helix-mcp']): group = 'MCP Architecture'
-            elif any(k in cl for k in ['sqlite', 'pg_sync', 'vacuum', 'postgres', 'fts']): group = 'Infrastructure'
-            elif any(k in cl for k in ['storage', 'minio', 'write', 'file', 'garage']): group = 'Storage'
+            elif any(k in cl for k in ['sqlite', 'pg_sync', 'vacuum', 'postgres', 'fts']): group = 'Database'
+            elif any(k in cl for k in ['storage', 'minio', 'write', 'file', 'garage', 'git']): group = 'Storage'
             elif any(k in cl for k in ['ingest', 'shard', 'flush', 'chunk']): group = 'Ingestion'
-            elif any(k in cl for k in ['haiku', 'observer', 'assembler', 'reconcil']): group = 'Intelligence'
+            elif any(k in cl for k in ['haiku', 'observer', 'assembler', 'reconcil', 'journal']): group = 'Intelligence'
             elif any(k in cl for k in ['compress', 'language', 'phrase']): group = 'Compression'
             elif any(k in cl for k in ['auth', 'tenant', 'login', 'oauth']): group = 'Auth'
             elif any(k in cl for k in ['deploy', 'docker', 'container', 'vps', 'traefik']): group = 'Infrastructure'
@@ -123,26 +192,30 @@ async def master_status():
             })
             adr_idx += 1
 
-        # Journal: one entry per unique date
-        journal = []
-        seen_dates = set()
-        for row in recent_rows:
-            content, session, created, collection = row
-            if len(journal) >= 8: break
-            date_str = str(created)[:10] if created else '?'
-            if date_str in seen_dates: continue
-            seen_dates.add(date_str)
-            title = (content or '').split('\n')[0][:80]
-            journal.append({
-                'date': date_str,
-                'session': str(session)[:8],
-                'title': title,
-                'body': (content or '')[:500],
-                'decisions': [{'text': title, 'status': 'live'}],
-                'build_plan': [],
-                'glance': (content or '')[:200],
-                'tags': [collection, str(session)[:8]],
-            })
+        # Journal: read from journal.md (source of truth — human-readable dev log)
+        journal = _parse_journal_md(max_entries=20)
+
+        # Fallback: if journal.md is empty, use archive data
+        if not journal:
+            seen_dates = set()
+            for row in recent_rows:
+                content, session, created, collection = row
+                if len(journal) >= 8: break
+                date_str = str(created)[:10] if created else '?'
+                if date_str in seen_dates: continue
+                seen_dates.add(date_str)
+                title = (content or '').split('\n')[0][:80]
+                if _is_ts(title): continue
+                journal.append({
+                    'date': date_str,
+                    'session': str(session)[:8],
+                    'title': title,
+                    'body': (content or '')[:500],
+                    'decisions': [{'text': title, 'status': 'live'}],
+                    'build_plan': [],
+                    'glance': '',
+                    'tags': [collection, str(session)[:8]],
+                })
 
         last_session = {
             'date': journal[0]['date'] if journal else str(datetime.now(timezone.utc))[:10],
