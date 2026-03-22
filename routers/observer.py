@@ -407,7 +407,7 @@ async def log_action(action: ActionLog, background_tasks: BackgroundTasks):
             action.timestamp or datetime.now(timezone.utc).isoformat(),
             action.session_id, action.sequence_num, action.tool_name,
             action.server_name, action.category,
-            json.dumps(action.arguments)[:10000], action.result_summary,
+            json.dumps({k: (str(v)[:500] if isinstance(v, str) and len(str(v)) > 500 else v) for k, v in (action.arguments or {}).items()}) if action.arguments else '{}', action.result_summary,
             1 if action.has_file_content else 0, action.file_path,
             action.duration_ms, 1 if action.error else 0,
         ))

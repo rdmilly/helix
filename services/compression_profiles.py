@@ -115,7 +115,8 @@ class CompressionProfileService:
         return conn
 
     def _fts_db(self) -> sqlite3.Connection:
-        conn = pg_sync.sqlite_conn(str(FTS_DB_PATH))
+        conn = sqlite3.connect(str(FTS_DB_PATH), timeout=10)
+        conn.row_factory = sqlite3.Row
         return conn
 
     def _ensure_table(self):

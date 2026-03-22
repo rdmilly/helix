@@ -164,13 +164,10 @@ def write_file_journal_entry(path: str, session_id: str, context: str = '', git_
         if git_result and git_result.get('status') == 'committed':
             msg = git_result.get('commit_msg', '')
             pushed = '↑ pushed' if git_result.get('pushed') else 'local only'
-            commit_info = f'
-- git: {msg} ({pushed})'
+            commit_info = f'\n- git: {msg} ({pushed})'
         
         lines = [
-            f'
----
-',
+            f'\n---\n',
             f'## {date_str} {time_str} — {rel_path}',
         ]
         if context:
@@ -180,14 +177,11 @@ def write_file_journal_entry(path: str, session_id: str, context: str = '', git_
             lines.append(commit_info.strip())
         lines.append(f'- session: {session_id[:12]}')
         
-        entry = '
-'.join(lines) + '
-'
+        entry = '\n'.join(lines) + '\n'
         with open(JOURNAL_PATH, 'r+', encoding='utf-8') as f:
             existing = f.read()
             # Insert after the header line
-            header_end = existing.find('
-', existing.find('_Auto-appended')) + 1
+            header_end = existing.find('\n', existing.find('_Auto-appended')) + 1
             if header_end > 0:
                 f.seek(header_end)
                 rest = existing[header_end:]

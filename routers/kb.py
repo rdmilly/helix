@@ -76,7 +76,13 @@ def _index_directory(source: str, base_path: Path) -> Dict[str, int]:
                 conn.execute(
                     '''INSERT INTO kb_documents
                        (id, source, path, title, content, content_hash, size_bytes, indexed_at)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (id) DO UPDATE SET
+                         content=EXCLUDED.content,
+                         content_hash=EXCLUDED.content_hash,
+                         size_bytes=EXCLUDED.size_bytes,
+                         indexed_at=EXCLUDED.indexed_at,
+                         title=EXCLUDED.title''',
                     (doc_id, source, rel_path, title, content, content_hash,
                      len(content.encode('utf-8')),
                      datetime.now(timezone.utc).isoformat())
@@ -128,7 +134,6 @@ async def kb_search(
         results = []
         for r in rows:
             d = dict(r)
-            # Truncate content for response
             if len(d.get('content', '')) > 500:
                 d['content_preview'] = d['content'][:500] + '...'
                 d['content_length'] = len(d['content'])
@@ -159,10 +164,11 @@ class IndexFileRequest(BaseModel):
     source: str
     path: str
     content: Optional[str] = None
+    session_id: Optional[str] = None  # passed by file_events pipeline
 
 @router.post("/index-file")
 async def index_single_file(req: IndexFileRequest):
-    """Index or re-index a single KB file. Called by webhook on changes."""
+    """Index or re-index a single KB file. Called by file_events pipeline and webhooks."""
     conn = _get_conn()
     try:
         content = req.content
@@ -184,7 +190,13 @@ async def index_single_file(req: IndexFileRequest):
         conn.execute(
             '''INSERT INTO kb_documents
                (id, source, path, title, content, content_hash, size_bytes, indexed_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (id) DO UPDATE SET
+                 content=EXCLUDED.content,
+                 content_hash=EXCLUDED.content_hash,
+                 size_bytes=EXCLUDED.size_bytes,
+                 indexed_at=EXCLUDED.indexed_at,
+                 title=EXCLUDED.title''',
             (doc_id, req.source, req.path, title, content, content_hash,
              len(content.encode('utf-8')),
              datetime.now(timezone.utc).isoformat())
@@ -202,7 +214,6 @@ async def reindex_all(background_tasks: BackgroundTasks):
         for source, path in KB_SOURCES.items():
             results[source] = _index_directory(source, path)
             logger.info(f"KB reindex {source}: {results[source]}")
-        # Rebuild FTS
         conn = _get_conn()
         try:
             conn.execute("INSERT INTO kb_fts(kb_fts) VALUES('rebuild')")

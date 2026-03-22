@@ -384,62 +384,61 @@ async def _summarize_conversations(
 
                 conn.commit()
 
-            # Nudges: create nudge for RISK items without a recent mitigating DECISION
-            for item in by_tag.get('RISK', []):
-                content = item.get('content', '')
-                if not content:
-                    continue
-                try:
-                    # Check if any recent DECISION addresses this risk (simple keyword overlap)
-                    risk_words = set(content.lower().split()[:8])
-                    mitigated = False
-                    for dec in by_tag.get('DECISION', []):
-                        dec_words = set(dec.get('content', '').lower().split())
-                        if len(risk_words & dec_words) >= 2:
-                            mitigated = True
-                            break
-                    if not mitigated:
+                # Nudges: create nudge for RISK items without a recent mitigating DECISION
+                for item in by_tag.get('RISK', []):
+                    content = item.get('content', '')
+                    if not content:
+                        continue
+                    try:
+                        # Check if any recent DECISION addresses this risk (simple keyword overlap)
+                        risk_words = set(content.lower().split()[:8])
+                        mitigated = False
+                        for dec in by_tag.get('DECISION', []):
+                            dec_words = set(dec.get('content', '').lower().split())
+                            if len(risk_words & dec_words) >= 2:
+                                mitigated = True
+                                break
+                        if not mitigated:
+                            conn.execute(
+                                "INSERT INTO nudges (id, description, category, priority, state, "
+                                "session_id, created_at, meta) VALUES (?,?,?,?,?,?,?,?)",
+                                (
+                                    str(uuid_mod.uuid4())[:12],
+                                    f"[RISK] {content[:200]}",
+                                    "risk",
+                                    "medium",
+                                    "open",
+                                    conv_id,
+                                    now,
+                                    json.dumps({"component": item.get("component"), "confidence": item.get("confidence", 0.7)})
+                                )
+                            )
+                    except Exception:
+                        pass
+
+                # Nudges: create nudge for ASSUMPTION items older than 3 sessions without validation
+                for item in by_tag.get('ASSUMPTION', []):
+                    content = item.get('content', '')
+                    if not content:
+                        continue
+                    try:
                         conn.execute(
                             "INSERT INTO nudges (id, description, category, priority, state, "
-                            "session_id, created_at, meta) VALUES (?,?,?,?,?,?,?,?)",
+                            "session_id, created_at, meta) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
                             (
                                 str(uuid_mod.uuid4())[:12],
-                                f"[RISK] {content[:200]}",
-                                "risk",
-                                "medium",
+                                f"[ASSUMPTION unvalidated] {content[:200]}",
+                                "assumption",
+                                "low",
                                 "open",
                                 conv_id,
                                 now,
-                                json.dumps({"component": item.get("component"), "confidence": item.get("confidence", 0.7)})
+                                json.dumps({"component": item.get("component"), "needs_validation": True})
                             )
                         )
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
-            # Nudges: create nudge for ASSUMPTION items older than 3 sessions without validation
-            for item in by_tag.get('ASSUMPTION', []):
-                content = item.get('content', '')
-                if not content:
-                    continue
-                try:
-                    conn.execute(
-                        "INSERT INTO nudges (id, description, category, priority, state, "
-                        "session_id, created_at, meta) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
-                        (
-                            str(uuid_mod.uuid4())[:12],
-                            f"[ASSUMPTION unvalidated] {content[:200]}",
-                            "assumption",
-                            "low",
-                            "open",
-                            conv_id,
-                            now,
-                            json.dumps({"component": item.get("component"), "needs_validation": True})
-                        )
-                    )
-                except Exception:
-                    pass
-
-            conn.commit()
 
             # ChromaDB: session summary + each intelligence item as separate vector
             try:
