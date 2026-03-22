@@ -88,6 +88,10 @@ async def handle_file_written(payload: Dict[str, Any]) -> Dict[str, Any]:
         tasks.append(_queue_snapshot(path, session_id))
         labels.append("snapshot")
 
+    # Site updater: refresh helixmaster commit feed on every write
+    tasks.append(asyncio.to_thread(_update_site))
+    labels.append("site_updater")
+
     if not tasks:
         return {"event": "file.written", "path": path, "subscribers": 0, "results": {}}
 
