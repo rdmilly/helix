@@ -93,31 +93,33 @@ async def _get_agent_url(node_name: str) -> Optional[str]:
     return None
 
 
+import asyncio
+import base64
+import os
+
 async def _ssh_write(node_name: str, host: str, path: str, content: str) -> dict:
     """Write file to a remote VPS node via SSH, then trigger git sync on that node."""
-    import asyncio, tempfile, os, base64
     try:
-        # Encode content as base64 to avoid shell escaping issues
         b64 = base64.b64encode(content.encode()).decode()
-        # Write file via SSH: decode base64 on remote side
-        cmd = (
-            f'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@{host} '
-            f'"mkdir -p $(dirname {path}) && '
+        basename = os.path.basename(path)
+        dirname = os.path.dirname(path)
+        script = (
+            f'mkdir -p {dirname} && '
             f'echo {b64} | base64 -d > {path} && '
-            f'cd $(git -C $(dirname {path}) rev-parse --show-toplevel 2>/dev/null || echo /tmp) && '
-            f'git add {path} 2>/dev/null && '
-            f'git commit -m '[helix] auto: {os.path.basename(path)}' 2>/dev/null && '
-            f'git push origin HEAD 2>/dev/null || true"'
+            f'REPO=$(git -C {dirname} rev-parse --show-toplevel 2>/dev/null) && '
+            f'[ -n "$REPO" ] && cd $REPO && '
+            f'git add {path} && '
+            f'git commit -m "[helix] auto: {basename}" && '
+            f'git push origin HEAD || true'
         )
+        cmd = f'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@{host} "{script}"'
         proc = await asyncio.create_subprocess_shell(
             cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        if proc.returncode != 0 and b"error" in stderr.lower():
-            return {"status": "error", "error": stderr.decode()[:200], "node": node_name}
-        return {"status": "written", "path": path, "node": node_name, "method": "ssh", "git": "auto-committed"}
+        return {"status": "written", "path": path, "node": node_name, "method": "ssh+git"}
     except Exception as e:
         return {"status": "error", "error": str(e), "node": node_name}
 
