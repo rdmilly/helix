@@ -21,10 +21,16 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GIT_AUTHOR_NAME = "Helix Cortex"
 GIT_AUTHOR_EMAIL = "helix@millyweb.com"
 
-# Repos we know about + their remote URLs
+# Repos we know about + their remote URLs and target branch
 KNOWN_REPOS = {
-    "/opt/projects/memory-ext": "https://rdmilly:{token}@github.com/rdmilly/membrain.git",
-    "/opt/projects/helix": "https://rdmilly:{token}@github.com/rdmilly/helix.git",
+    "/opt/projects/memory-ext": {
+        "url": "https://rdmilly:{token}@github.com/rdmilly/membrain.git",
+        "branch": "main",
+    },
+    "/opt/projects/helix": {
+        "url": "https://rdmilly:{token}@github.com/rdmilly/helix.git",
+        "branch": "main",
+    },
 }
 
 
@@ -99,27 +105,26 @@ def auto_commit(path: str, session_id: str = "helix", context: str = "") -> dict
 
     log.info(f"[GitSync] Committed: {msg}")
 
-    # Push — set remote URL with token if we know it
-    remote_url = None
-    for known_root, url_template in KNOWN_REPOS.items():
+    # Push to correct remote branch
+    repo_config = None
+    for known_root, cfg in KNOWN_REPOS.items():
         if repo_root.startswith(known_root):
-            remote_url = url_template.format(token=token)
+            repo_config = cfg
             break
 
-    if remote_url:
+    if repo_config:
+        remote_url = repo_config["url"].format(token=token)
+        target_branch = repo_config["branch"]
         # Set remote URL with embedded token (never stored in repo)
         _git(repo_root, "remote", "set-url", "origin", remote_url)
-        rc, out, err = _git(repo_root, "push", "origin", "HEAD")
+        rc, out, err = _git(repo_root, "push", "origin", f"HEAD:{target_branch}")
         # Reset remote URL to token-free version after push
-        for known_root, url_template in KNOWN_REPOS.items():
-            if repo_root.startswith(known_root):
-                clean_url = url_template.replace("{token}@", "").format(token="")
-                _git(repo_root, "remote", "set-url", "origin", clean_url)
-                break
+        clean_url = repo_config["url"].replace("{token}@", "").format(token="")
+        _git(repo_root, "remote", "set-url", "origin", clean_url)
         if rc != 0:
             log.warning(f"[GitSync] Push failed (commit saved locally): {err}")
             return {"status": "committed", "pushed": False, "commit_msg": msg, "push_err": err}
-        log.info(f"[GitSync] Pushed to GitHub")
-        return {"status": "committed", "pushed": True, "commit_msg": msg}
+        log.info(f"[GitSync] Pushed to GitHub ({target_branch})")
+        return {"status": "committed", "pushed": True, "commit_msg": msg, "branch": target_branch}
     else:
         return {"status": "committed", "pushed": False, "commit_msg": msg, "reason": "no remote configured"}
