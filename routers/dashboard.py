@@ -5,7 +5,7 @@ GET  /dashboard        — login page (enter API key)
 GET  /dashboard/home   — main dashboard (requires ?key=hx-...)
 """
 from fastapi import APIRouter, Request, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 dashboard_router = APIRouter()
 
@@ -209,6 +209,20 @@ _DASH_HTML = """
 
 
 @dashboard_router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+async def dashboard_login_redirect(request: Request):
+    """Redirect to central login if no session cookie."""
+    from services.auth_service import get_session
+    session = get_session(request)
+    if not session:
+        return RedirectResponse(url="https://helix.millyweb.com/login", status_code=302)
+    slug = session.get("slug", "")
+    return RedirectResponse(
+        url=f"https://{slug}.helix.millyweb.com/dashboard/home",
+        status_code=302
+    )
+
+
+@dashboard_router.get("/dashboard/_legacy", response_class=HTMLResponse, include_in_schema=False)
 def dashboard_login():
     # Redirect to proper login page
     return HTMLResponse(status_code=302, headers={"Location": "/login"})
