@@ -171,7 +171,7 @@ _REGISTER_HTML = '''
   }
 
   function step3done(){
-    window.location.href="/dashboard";
+    window.location.href="/dashboard/home";
   }
 </script></body></html>
 '''
@@ -218,7 +218,7 @@ _LOGIN_HTML = '''
       if(!r.ok){el.textContent=d.detail||"Invalid credentials.";el.style.display="block";return;}
       localStorage.setItem("helix_token",d.token);
       localStorage.setItem("helix_tenant",d.tenant_id);
-      window.location.href="/dashboard";
+      window.location.href="/dashboard/home";
     }catch(e){el.textContent="Network error.";el.style.display="block";}
   }
 </script></body></html>

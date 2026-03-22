@@ -230,8 +230,5 @@ def dashboard_login():
 
 @dashboard_router.get("/dashboard/home", response_class=HTMLResponse, include_in_schema=False)
 def dashboard_home(key: str = Query(default="")):
-    """Serves dashboard shell; JS fetches data using the key param."""
-    if not key:
-        return HTMLResponse(status_code=302, headers={"Location": "/dashboard"})
-    # Return the page with key embedded (key is only used client-side for API calls)
+    """Serves dashboard shell. JS reads auth from localStorage (JWT) or ?key= param."""
     return HTMLResponse(_DASH_HTML)
