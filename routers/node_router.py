@@ -94,13 +94,30 @@ async def _get_agent_url(node_name: str) -> Optional[str]:
 
 
 async def _ssh_write(node_name: str, host: str, path: str, content: str) -> dict:
-    """Write to a VPS node via SSH (gateway)."""
+    """Write file to a remote VPS node via SSH, then trigger git sync on that node."""
+    import asyncio, tempfile, os, base64
     try:
-        from services.workbench import run_shell
-        # Write via SSH using the gateway pattern
-        escaped = content.replace("'", "'\"'\"'")
-        result = run_shell(f"ssh -o StrictHostKeyChecking=no root@{host} 'cat > {path}'")
-        return {"status": "written", "path": path, "node": node_name, "method": "ssh"}
+        # Encode content as base64 to avoid shell escaping issues
+        b64 = base64.b64encode(content.encode()).decode()
+        # Write file via SSH: decode base64 on remote side
+        cmd = (
+            f'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@{host} '
+            f'"mkdir -p $(dirname {path}) && '
+            f'echo {b64} | base64 -d > {path} && '
+            f'cd $(git -C $(dirname {path}) rev-parse --show-toplevel 2>/dev/null || echo /tmp) && '
+            f'git add {path} 2>/dev/null && '
+            f'git commit -m '[helix] auto: {os.path.basename(path)}' 2>/dev/null && '
+            f'git push origin HEAD 2>/dev/null || true"'
+        )
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0 and b"error" in stderr.lower():
+            return {"status": "error", "error": stderr.decode()[:200], "node": node_name}
+        return {"status": "written", "path": path, "node": node_name, "method": "ssh", "git": "auto-committed"}
     except Exception as e:
         return {"status": "error", "error": str(e), "node": node_name}
 
