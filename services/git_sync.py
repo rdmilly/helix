@@ -1,19 +1,26 @@
 """Git Sync Service
 
-Subscribes to file.written events and auto-commits changed files
-to their git repo with the session context as the commit message.
+On every helix_file_write, creates a feature branch, commits the file,
+opens a pull request, then merges it — so the GitHub history looks like
+real collaborative development rather than direct pushes.
 
-Only fires when:
-  - The file path is inside a git repo
-  - The repo has a remote origin configured
-  - GITHUB_TOKEN is available
+Workflow per file write:
+  1. Create branch: helix/session-<id>-<short-path>
+  2. Commit file to that branch
+  3. Open PR: "[helix] <description>"
+  4. Merge PR (squash) -> main
+  5. Delete branch
 
-Commit format: "[helix] <session_id>: <path>"
+Falls back to direct push if GitHub API is unavailable.
 """
 import subprocess
 import logging
 import os
+import time
+import re
+import requests
 from pathlib import Path
+from datetime import datetime, timezone
 
 log = logging.getLogger("helix.git_sync")
 
@@ -21,21 +28,37 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GIT_AUTHOR_NAME = "Helix Cortex"
 GIT_AUTHOR_EMAIL = "helix@millyweb.com"
 
-# Repos we know about + their remote URLs and target branch
+# Repos: local root -> GitHub owner/repo + target branch
 KNOWN_REPOS = {
     "/opt/projects/memory-ext": {
-        "url": "https://rdmilly:{token}@github.com/rdmilly/membrain.git",
+        "remote": "rdmilly/membrain",
         "branch": "main",
     },
     "/opt/projects/helix": {
-        "url": "https://rdmilly:{token}@github.com/rdmilly/helix.git",
+        "remote": "rdmilly/helix",
         "branch": "main",
     },
 }
 
+GH_API = "https://api.github.com"
 
-def _find_repo_root(path: str) -> str | None:
-    """Walk up from path to find .git directory."""
+
+def _gh_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _sanitize_branch_name(s: str) -> str:
+    """Turn a file path into a valid branch name segment."""
+    s = re.sub(r'[^a-zA-Z0-9._-]', '-', s)
+    s = re.sub(r'-{2,}', '-', s).strip('-')
+    return s[:40]
+
+
+def _find_repo_root(path: str):
     p = Path(path)
     if p.is_file():
         p = p.parent
@@ -45,31 +68,94 @@ def _find_repo_root(path: str) -> str | None:
     return None
 
 
-def _git(repo_root: str, *args, token: str = "") -> tuple[int, str, str]:
-    """Run a git command in a repo."""
+def _git(repo_root: str, *args) -> tuple:
     env = os.environ.copy()
     env["GIT_AUTHOR_NAME"] = GIT_AUTHOR_NAME
     env["GIT_AUTHOR_EMAIL"] = GIT_AUTHOR_EMAIL
     env["GIT_COMMITTER_NAME"] = GIT_AUTHOR_NAME
     env["GIT_COMMITTER_EMAIL"] = GIT_AUTHOR_EMAIL
-    if token:
-        env["GIT_ASKPASS"] = "echo"
-        env["GIT_TOKEN"] = token
     result = subprocess.run(
         ["git"] + list(args),
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=30,
+        cwd=repo_root, capture_output=True, text=True, env=env, timeout=30,
     )
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
-def auto_commit(path: str, session_id: str = "helix", context: str = "") -> dict:
-    """Auto-commit a changed file to its git repo.
+def _get_main_sha(repo: str, branch: str, headers: dict) -> str | None:
+    """Get the latest commit SHA on the base branch."""
+    r = requests.get(f"{GH_API}/repos/{repo}/git/ref/heads/{branch}", headers=headers, timeout=10)
+    if r.status_code == 200:
+        return r.json()["object"]["sha"]
+    return None
 
-    Returns dict with status, committed (bool), and any error.
+
+def _create_branch(repo: str, branch_name: str, sha: str, headers: dict) -> bool:
+    r = requests.post(
+        f"{GH_API}/repos/{repo}/git/refs",
+        headers=headers,
+        json={"ref": f"refs/heads/{branch_name}", "sha": sha},
+        timeout=10,
+    )
+    return r.status_code in (200, 201, 422)  # 422 = already exists, that's fine
+
+
+def _delete_branch(repo: str, branch_name: str, headers: dict):
+    requests.delete(
+        f"{GH_API}/repos/{repo}/git/refs/heads/{branch_name}",
+        headers=headers, timeout=10,
+    )
+
+
+def _open_pr(repo: str, branch: str, base: str, title: str, body: str, headers: dict) -> int | None:
+    r = requests.post(
+        f"{GH_API}/repos/{repo}/pulls",
+        headers=headers,
+        json={"title": title, "head": branch, "base": base, "body": body},
+        timeout=10,
+    )
+    if r.status_code in (200, 201):
+        return r.json()["number"]
+    log.warning(f"PR open failed: {r.status_code} {r.text[:200]}")
+    return None
+
+
+def _merge_pr(repo: str, pr_number: int, commit_title: str, headers: dict) -> bool:
+    # Small delay so GitHub processes the PR
+    time.sleep(2)
+    r = requests.put(
+        f"{GH_API}/repos/{repo}/pulls/{pr_number}/merge",
+        headers=headers,
+        json={"merge_method": "squash", "commit_title": commit_title},
+        timeout=15,
+    )
+    return r.status_code == 200
+
+
+def _pr_body(path: str, session_id: str, context: str) -> str:
+    rel = Path(path).name
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        f"## {rel}",
+        "",
+        f"**Changed:** `{path}`",
+        f"**Session:** `{session_id[:16]}`",
+        f"**Time:** {ts}",
+    ]
+    if context:
+        lines += ["", f"**Context:** {context[:200]}"]
+    lines += [
+        "",
+        "---",
+        "*Auto-generated by [Helix Cortex](https://helix.millyweb.com) write pipeline.*",
+    ]
+    return "\n".join(lines)
+
+
+def auto_commit(path: str, session_id: str = "helix", context: str = "") -> dict:
+    """Commit a changed file via the branch -> PR -> merge workflow.
+
+    Falls back to direct push if the GitHub API is unavailable or the
+    file has no changes to commit.
     """
     token = GITHUB_TOKEN
     if not token:
@@ -79,52 +165,112 @@ def auto_commit(path: str, session_id: str = "helix", context: str = "") -> dict
     if not repo_root:
         return {"status": "skipped", "reason": "not in a git repo"}
 
-    # Check if there are changes to commit
+    # Detect changes
     rc, out, err = _git(repo_root, "status", "--porcelain", path)
     if rc != 0 or not out.strip():
         return {"status": "skipped", "reason": "no changes to commit"}
 
-    # Stage the file
-    rc, out, err = _git(repo_root, "add", path)
-    if rc != 0:
-        return {"status": "error", "reason": f"git add failed: {err}"}
-
-    # Build commit message
-    rel_path = Path(path).relative_to(repo_root) if repo_root in path else path
-    msg = f"[helix] {rel_path}"
-    if context:
-        msg += f" — {context[:80]}"
-    elif session_id and session_id != "helix":
-        msg += f" ({session_id[:12]})"
-
-    # Commit
-    rc, out, err = _git(repo_root, "commit", "-m", msg)
-    if rc != 0:
-        log.warning(f"git commit failed: {err}")
-        return {"status": "error", "reason": err}
-
-    log.info(f"[GitSync] Committed: {msg}")
-
-    # Push to correct remote branch
+    # Find repo config
     repo_config = None
     for known_root, cfg in KNOWN_REPOS.items():
         if repo_root.startswith(known_root):
             repo_config = cfg
             break
+    if not repo_config:
+        return {"status": "skipped", "reason": "repo not in KNOWN_REPOS"}
 
-    if repo_config:
-        remote_url = repo_config["url"].format(token=token)
-        target_branch = repo_config["branch"]
-        # Set remote URL with embedded token (never stored in repo)
+    gh_repo = repo_config["remote"]
+    base_branch = repo_config["branch"]
+    headers = _gh_headers(token)
+
+    # Build names
+    rel_path = str(Path(path).relative_to(repo_root)) if repo_root in path else Path(path).name
+    short = _sanitize_branch_name(rel_path)
+    ts_slug = datetime.now(timezone.utc).strftime("%m%d-%H%M")
+    branch_name = f"helix/{ts_slug}-{short}"
+
+    commit_title = f"[helix] {rel_path}"
+    if context:
+        commit_title += f" — {context[:60]}"
+    elif session_id and session_id not in ("helix", "workbench"):
+        commit_title += f" ({session_id[:12]})"
+
+    # === GitHub API workflow ===
+    try:
+        # 1. Get base SHA
+        base_sha = _get_main_sha(gh_repo, base_branch, headers)
+        if not base_sha:
+            raise ValueError(f"Could not get SHA for {base_branch}")
+
+        # 2. Create feature branch
+        _create_branch(gh_repo, branch_name, base_sha, headers)
+
+        # 3. Commit file to feature branch via local git
+        remote_url = f"https://rdmilly:{token}@github.com/{gh_repo}.git"
         _git(repo_root, "remote", "set-url", "origin", remote_url)
-        rc, out, err = _git(repo_root, "push", "origin", f"HEAD:{target_branch}")
-        # Reset remote URL to token-free version after push
-        clean_url = repo_config["url"].replace("{token}@", "").format(token="")
-        _git(repo_root, "remote", "set-url", "origin", clean_url)
+        _git(repo_root, "fetch", "origin", base_branch)
+        rc, _, err = _git(repo_root, "checkout", "-B", branch_name, f"origin/{base_branch}")
         if rc != 0:
-            log.warning(f"[GitSync] Push failed (commit saved locally): {err}")
-            return {"status": "committed", "pushed": False, "commit_msg": msg, "push_err": err}
-        log.info(f"[GitSync] Pushed to GitHub ({target_branch})")
-        return {"status": "committed", "pushed": True, "commit_msg": msg, "branch": target_branch}
-    else:
-        return {"status": "committed", "pushed": False, "commit_msg": msg, "reason": "no remote configured"}
+            raise ValueError(f"checkout failed: {err}")
+
+        _git(repo_root, "add", path)
+        rc, _, err = _git(repo_root, "commit", "-m", commit_title)
+        if rc != 0:
+            # Nothing to commit on this branch — file was already up to date
+            _git(repo_root, "checkout", base_branch)
+            _delete_branch(gh_repo, branch_name, headers)
+            return {"status": "skipped", "reason": "nothing to commit"}
+
+        rc, _, err = _git(repo_root, "push", "-u", "origin", branch_name)
+        if rc != 0:
+            raise ValueError(f"push failed: {err}")
+
+        # Return to main so subsequent writes work cleanly
+        _git(repo_root, "checkout", base_branch)
+        _git(repo_root, "pull", "origin", base_branch)
+        _git(repo_root, "remote", "set-url", "origin", f"https://github.com/{gh_repo}.git")
+
+        # 4. Open PR
+        pr_body = _pr_body(path, session_id, context)
+        pr_number = _open_pr(gh_repo, branch_name, base_branch, commit_title, pr_body, headers)
+        if not pr_number:
+            raise ValueError("PR creation failed")
+
+        # 5. Merge PR
+        merged = _merge_pr(gh_repo, pr_number, commit_title, headers)
+        if merged:
+            _delete_branch(gh_repo, branch_name, headers)
+            log.info(f"[GitSync] PR #{pr_number} merged → {base_branch}: {commit_title}")
+            return {
+                "status": "merged",
+                "pr": pr_number,
+                "branch": branch_name,
+                "commit_msg": commit_title,
+                "pushed": True,
+            }
+        else:
+            log.warning(f"[GitSync] PR #{pr_number} opened but merge failed")
+            return {
+                "status": "pr_open",
+                "pr": pr_number,
+                "branch": branch_name,
+                "commit_msg": commit_title,
+                "pushed": True,
+            }
+
+    except Exception as e:
+        log.warning(f"[GitSync] PR workflow failed ({e}), falling back to direct push")
+        # Fallback: direct push to main
+        try:
+            _git(repo_root, "checkout", base_branch)
+            remote_url = f"https://rdmilly:{token}@github.com/{gh_repo}.git"
+            _git(repo_root, "remote", "set-url", "origin", remote_url)
+            _git(repo_root, "add", path)
+            _git(repo_root, "commit", "-m", commit_title)
+            rc, _, err = _git(repo_root, "push", "origin", f"HEAD:{base_branch}")
+            _git(repo_root, "remote", "set-url", "origin", f"https://github.com/{gh_repo}.git")
+            if rc == 0:
+                return {"status": "committed", "pushed": True, "commit_msg": commit_title, "fallback": True}
+            return {"status": "error", "reason": err}
+        except Exception as e2:
+            return {"status": "error", "reason": str(e2)}
