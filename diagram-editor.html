@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HELIX/master — Diagram Editor</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;user-select:none}
+:root{
+  --bg:#0a0c0f;--surface:#111418;--surface2:#1a1f26;--surface3:#222830;
+  --border:rgba(255,255,255,0.07);--border-bright:rgba(255,255,255,0.15);
+  --text:#c8d0db;--text-dim:#5a6472;--text-bright:#e8edf3;
+  --accent:#00d4aa;--accent2:#3b82f6;--warn:#f59e0b;--live:#22c55e;
+  --mono:'IBM Plex Mono',monospace;
+}
+body{font-family:var(--mono);background:var(--bg);color:var(--text);height:100vh;overflow:hidden;display:flex;flex-direction:column}
+
+/* ── TOP BAR ── */
+#topbar{display:flex;align-items:center;gap:8px;height:44px;padding:0 14px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap}
+.logo{font-size:14px;font-weight:600;color:var(--accent);letter-spacing:.04em;margin-right:4px}
+.logo span{color:var(--text-dim);font-weight:400}
+.sep{width:1px;height:20px;background:var(--border-bright);margin:0 2px}
+.diagram-tab{padding:4px 11px;font-size:10px;letter-spacing:.06em;border:1px solid rgba(255,255,255,0.1);border-radius:3px;cursor:pointer;color:var(--text-dim);background:transparent;transition:all .15s;font-family:var(--mono)}
+.diagram-tab.active{color:var(--accent);border-color:rgba(0,212,170,.4);background:rgba(0,212,170,.06)}
+.diagram-tab:hover:not(.active){color:var(--text)}
+.tbtn{padding:4px 10px;font-size:10px;letter-spacing:.04em;border:1px solid rgba(255,255,255,0.12);border-radius:3px;cursor:pointer;background:transparent;color:var(--text-dim);transition:all .15s;font-family:var(--mono)}
+.tbtn:hover{color:var(--text);border-color:var(--border-bright)}
+.tbtn.active{color:var(--warn);border-color:rgba(245,158,11,.4);background:rgba(245,158,11,.06)}
+.tbtn.primary{color:var(--accent);border-color:rgba(0,212,170,.4);background:rgba(0,212,170,.06)}
+.tbtn.primary:hover{background:rgba(0,212,170,.12)}
+#status-pill{margin-left:auto;font-size:9px;color:var(--text-dim);letter-spacing:.06em;display:flex;align-items:center;gap:6px}
+.pulse{width:6px;height:6px;border-radius:50%;background:var(--live);animation:blink 2s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* ── MAIN LAYOUT ── */
+#main{flex:1;display:flex;overflow:hidden}
+
+/* ── LEFT PANEL ── */
+#left-panel{width:220px;border-right:1px solid var(--border);background:var(--surface);display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto}
+.panel-hdr{padding:10px 14px;border-bottom:1px solid var(--border);font-size:9px;letter-spacing:.1em;color:var(--text-dim);text-transform:uppercase}
+.diag-list-item{padding:10px 14px;cursor:pointer;border-left:2px solid transparent;transition:all .15s;font-size:11px;color:var(--text-dim)}
+.diag-list-item:hover{background:var(--surface2);color:var(--text)}
+.diag-list-item.active{border-left-color:var(--accent);color:var(--accent);background:rgba(0,212,170,.05)}
+.diag-list-item .dli-title{font-size:11px;margin-bottom:2px}
+.diag-list-item .dli-sub{font-size:9px;color:var(--text-dim);opacity:.7}
+
+/* ── CANVAS ── */
+#canvas-wrap{flex:1;overflow:auto;position:relative;background:var(--bg);cursor:default}
+#canvas-inner{position:relative}
+#canvas-inner svg.arrows{position:absolute;top:0;left:0;pointer-events:none;overflow:visible}
+.node{position:absolute;border-radius:3px;cursor:grab;transition:box-shadow .1s}
+.node:active{cursor:grabbing}
+.node.selected{outline:2px solid var(--accent);outline-offset:2px;z-index:10}
+.node.connect-source{outline:2px solid var(--warn);outline-offset:2px}
+.node-inner{padding:9px 12px;height:100%;display:flex;flex-direction:column;justify-content:center}
+.node-title{font-size:9px;letter-spacing:.1em;font-weight:600;margin-bottom:3px}
+.node-sub{font-size:8px;color:var(--text-dim);line-height:1.55}
+.node-sub span{display:block}
+.layer-band{position:absolute;border-radius:3px;pointer-events:none}
+.layer-label{position:absolute;font-size:8px;letter-spacing:.15em;pointer-events:none}
+
+/* ── RIGHT PANEL ── */
+#right-panel{width:200px;border-left:1px solid var(--border);background:var(--surface);display:flex;flex-direction:column;overflow-y:auto}
+.prop-row{padding:8px 12px;border-bottom:1px solid var(--border)}
+.prop-label{font-size:9px;color:var(--text-dim);letter-spacing:.06em;margin-bottom:5px}
+.prop-input{width:100%;background:var(--surface2);border:1px solid var(--border-bright);border-radius:3px;color:var(--text);font-family:var(--mono);font-size:10px;padding:5px 7px;resize:none}
+.prop-input:focus{outline:none;border-color:rgba(0,212,170,.4)}
+select.prop-input option{background:var(--surface2)}
+.color-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:4px}
+.color-swatch{padding:4px 6px;border-radius:2px;font-size:9px;cursor:pointer;border:1px solid transparent;text-align:center;transition:all .1s}
+.color-swatch.active{border-color:rgba(255,255,255,.4)}
+.edge-list{padding:8px 12px}
+.edge-item{display:flex;align-items:center;gap:6px;padding:4px 0;font-size:9px;border-bottom:1px solid var(--border);cursor:pointer}
+.edge-item:hover{color:var(--danger)}
+.edge-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+
+/* ── EXPORT MODAL ── */
+#modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;z-index:50;align-items:center;justify-content:center}
+#modal-bg.open{display:flex}
+#modal{background:var(--surface);border:1px solid rgba(0,212,170,.3);border-radius:4px;padding:20px;width:660px;max-height:80vh;display:flex;flex-direction:column}
+#modal h3{font-size:11px;letter-spacing:.08em;color:var(--accent);margin-bottom:10px}
+#modal pre{font-size:9px;color:var(--text);background:var(--bg);padding:12px;border-radius:3px;overflow:auto;flex:1;white-space:pre-wrap;word-break:break-all;margin-bottom:10px}
+.modal-footer{display:flex;gap:8px;justify-content:flex-end}
+
+/* ── GRID BACKGROUND ── */
+.grid-bg{background-image:linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);background-size:40px 40px}
+</style>
+</head>
+<body>
+
+<!-- TOP BAR -->
+<div id="topbar">
+  <div class="logo">HELIX<span>/diagrams</span></div>
+  <div class="sep"></div>
+  <button class="tbtn" id="btn-add" onclick="addNode()">+ node</button>
+  <button class="tbtn" id="btn-connect" onclick="toggleConnect()">connect</button>
+  <button class="tbtn" id="btn-band" onclick="toggleBand()">+ band</button>
+  <button class="tbtn" id="btn-delete" onclick="deleteSelected()">delete</button>
+  <div class="sep"></div>
+  <button class="tbtn" id="btn-undo" onclick="undo()">undo</button>
+  <div class="sep"></div>
+  <button class="tbtn primary" onclick="openExport()">export for Claude</button>
+  <div id="status-pill"><div class="pulse"></div><span id="status-txt">ready</span></div>
+</div>
+
+<!-- MAIN -->
+<div id="main">
+
+  <!-- LEFT: diagram list -->
+  <div id="left-panel">
+    <div class="panel-hdr">Diagrams</div>
+    <div id="diag-list"></div>
+    <div style="margin-top:auto;padding:12px;border-top:1px solid var(--border)">
+      <div style="font-size:9px;color:var(--text-dim);line-height:1.8">
+        <div style="color:var(--accent);letter-spacing:.06em;margin-bottom:4px">HOW TO USE</div>
+        drag — move boxes<br>
+        dbl-click — edit text<br>
+        connect — link two boxes<br>
+        click edge — remove it<br>
+        export — send to Claude
+      </div>
+    </div>
+  </div>
+
+  <!-- CENTER: canvas -->
+  <div id="canvas-wrap" class="grid-bg">
+    <div id="canvas-inner">
+      <svg class="arrows" id="arrows-svg"><defs>
+        <marker id="arr-teal"  markerWidth="7" markerHeight="7" refX="5" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3z" fill="#00d4aa"/></marker>
+        <marker id="arr-blue"  markerWidth="7" markerHeight="7" refX="5" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3z" fill="#3b82f6"/></marker>
+        <marker id="arr-amber" markerWidth="7" markerHeight="7" refX="5" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3z" fill="#f59e0b"/></marker>
+        <marker id="arr-green" markerWidth="7" markerHeight="7" refX="5" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3z" fill="#22c55e"/></marker>
+        <marker id="arr-dim"   markerWidth="7" markerHeight="7" refX="5" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3z" fill="#5a6472"/></marker>
+        <marker id="arr-white" markerWidth="7" markerHeight="7" refX="5" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3z" fill="#e8edf3"/></marker>
+      </defs></svg>
+    </div>
+  </div>
+
+  <!-- RIGHT: properties -->
+  <div id="right-panel">
+    <div class="panel-hdr">Properties</div>
+    <div id="props-empty" style="padding:14px 12px;font-size:10px;color:var(--text-dim);line-height:1.7">Select a node<br>to edit properties.</div>
+    <div id="props-node" style="display:none">
+      <div class="prop-row">
+        <div class="prop-label">TITLE</div>
+        <input class="prop-input" id="p-title" type="text" oninput="applyPropTitle()">
+      </div>
+      <div class="prop-row">
+        <div class="prop-label">SUBTITLES (one per line)</div>
+        <textarea class="prop-input" id="p-subs" rows="4" oninput="applyPropSubs()"></textarea>
+      </div>
+      <div class="prop-row">
+        <div class="prop-label">COLOR</div>
+        <div class="color-grid" id="color-grid"></div>
+      </div>
+      <div class="prop-row">
+        <div class="prop-label">BORDER STYLE</div>
+        <select class="prop-input" id="p-dash" onchange="applyPropDash()">
+          <option value="solid">solid</option>
+          <option value="dashed">dashed</option>
+        </select>
+      </div>
+      <div class="prop-row">
+        <div class="prop-label">SIZE</div>
+        <div style="display:flex;gap:6px">
+          <input class="prop-input" id="p-w" type="number" style="width:70px" oninput="applyPropSize()" placeholder="W">
+          <input class="prop-input" id="p-h" type="number" style="width:70px" oninput="applyPropSize()" placeholder="H">
+        </div>
+      </div>
+    </div>
+    <div class="panel-hdr" style="margin-top:auto">Connections</div>
+    <div id="edge-list" class="edge-list"></div>
+  </div>
+</div>
+
+<!-- EXPORT MODAL -->
+<div id="modal-bg" onclick="e=>e.target===this&&closeModal()">
+  <div id="modal">
+    <h3>EXPORT — PASTE THIS TO CLAUDE</h3>
+    <pre id="modal-pre"></pre>
+    <div class="modal-footer">
+      <button class="tbtn primary" onclick="copyExport()">copy</button>
+      <button class="tbtn" onclick="closeModal()">close</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─────────────────────────────────────────────────
+// STATE
+// ─────────────────────────────────────────────────
+const DIAGRAMS = {
+  'd06': {
+    label:'06 — Platform',
+    sub:'Three logical layers',
+    nodes:[
+      {id:'user',    x:40,  y:60,  w:150, h:62, color:'blue',  title:'USER',            subs:['queries · builds','reads · reviews']},
+      {id:'claude',  x:210, y:60,  w:155, h:62, color:'white', title:'CLAUDE.AI',        subs:['LLM · MCP host','chat interface']},
+      {id:'membrain',x:385, y:60,  w:210, h:62, color:'teal',  title:'MEMBRAIN',         subs:['Chrome ext · context bridge','intercepts → injects tier-1 → fwds'],dash:true},
+      {id:'extconn', x:615, y:60,  w:180, h:62, color:'dim',   title:'EXT. CONNECTORS', subs:['Dart · Gmail · Calendar','GitHub · Slack · others']},
+      {id:'helix',   x:38,  y:215, w:215, h:138,color:'teal',  title:'HELIX CORTEX',    subs:['FastAPI · FastMCP · 20 tools','5 routers: search · read · write','intel · exchange','★ helix_file_write pipeline']},
+      {id:'forge',   x:270, y:215, w:170, h:138,color:'amber', title:'THE FORGE',        subs:['File workspace','CRUD · MinIO versioning','atom scanner','989 atoms · 113 molecules']},
+      {id:'observer',x:455, y:215, w:185, h:138,color:'green', title:'OBSERVER',         subs:['Event stream','captures tool calls','Haiku reconciler','nightly cron → KB index']},
+      {id:'prov',    x:672, y:200, w:168, h:155,color:'blue',  title:'PROVISIONER',      subs:['MCP registry','45 servers · 697 tools','HOT · WARM · COLD','routes to Helix'],dash:true},
+      {id:'chroma',  x:45,  y:420, w:148, h:72, color:'blue',  title:'CHROMADB',         subs:['Vector search','semantic similarity']},
+      {id:'postgres',x:210, y:420, w:148, h:72, color:'blue',  title:'POSTGRESQL',       subs:['Relational store','KB docs · KG entities']},
+      {id:'fts5',    x:375, y:420, w:148, h:72, color:'blue',  title:'FTS5 / SQLITE',    subs:['Full-text search','keyword queries']},
+      {id:'minio',   x:540, y:420, w:128, h:72, color:'amber', title:'MINIO',            subs:['Object store','file versions']},
+      {id:'obsdb',   x:685, y:420, w:115, h:72, color:'green', title:'OBSERVER DB',      subs:['SQLite','events · sessions']},
+    ],
+    edges:[
+      {from:'user',    to:'claude',   color:'blue'},
+      {from:'claude',  to:'membrain', color:'teal',  label:'enriches'},
+      {from:'membrain',to:'helix',    color:'teal',  label:'MCP calls'},
+      {from:'helix',   to:'forge',    color:'amber', label:'file ops'},
+      {from:'helix',   to:'observer', color:'green', label:'events'},
+      {from:'prov',    to:'helix',    color:'blue',  label:'routes'},
+      {from:'extconn', to:'prov',     color:'dim',   label:'gateway', curved:true},
+      {from:'helix',   to:'chroma',   color:'blue'},
+      {from:'helix',   to:'postgres', color:'blue'},
+      {from:'forge',   to:'minio',    color:'amber'},
+      {from:'observer',to:'obsdb',    color:'green'},
+    ],
+    bands:[
+      {x:20,y:34,w:820,h:100,color:'rgba(59,130,246,0.04)',stroke:'rgba(59,130,246,0.15)',label:'INTERFACE LAYER',labelColor:'#3b82f6'},
+      {x:20,y:188,w:630,h:182,color:'rgba(0,212,170,0.02)',stroke:'rgba(0,212,170,0.22)',label:'INTELLIGENCE LAYER',labelColor:'#00d4aa'},
+      {x:20,y:392,w:820,h:110,color:'rgba(59,130,246,0.02)',stroke:'rgba(59,130,246,0.12)',label:'STORAGE LAYER',labelColor:'#3b82f6'},
+    ]
+  },
+  'd01': {
+    label:'01 — Context',
+    sub:'System context',
+    nodes:[
+      {id:'user',    x:45,  y:60,  w:145, h:58, color:'blue',  title:'USER / DEVELOPER', subs:['queries · builds · reviews']},
+      {id:'claude',  x:215, y:60,  w:155, h:58, color:'white', title:'CLAUDE.AI',          subs:['LLM · MCP host · chat']},
+      {id:'membrain',x:395, y:60,  w:195, h:58, color:'teal',  title:'MEMBRAIN',           subs:['Chrome ext · context bridge','intercepts → injects tier-1 → fwds'],dash:true},
+      {id:'extconn', x:615, y:60,  w:170, h:58, color:'dim',   title:'EXT. TOOLS',         subs:['Dart · Gmail · Calendar']},
+      {id:'helix',   x:155, y:190, w:295, h:148,color:'teal',  title:'HELIX CORTEX',        subs:['Intelligence Platform','FastAPI · FastMCP · 20 tools','ChromaDB · PostgreSQL · FTS5','MinIO versioning · Observer','search · read · write · intel · exchange']},
+      {id:'forge',   x:510, y:190, w:155, h:65, color:'amber', title:'THE FORGE',            subs:['File workspace','versioning · atom scanner']},
+      {id:'prov',    x:510, y:268, w:155, h:65, color:'blue',  title:'PROVISIONER',          subs:['MCP tool registry','45 servers · 697 tools']},
+      {id:'obs',     x:510, y:348, w:155, h:50, color:'green', title:'OBSERVER',             subs:['events · session log · cron']},
+      {id:'chroma',  x:40,  y:375, w:108, h:42, color:'blue',  title:'CHROMADB',             subs:['vector search']},
+      {id:'postgres',x:162, y:375, w:108, h:42, color:'blue',  title:'POSTGRESQL',           subs:['KG + relational']},
+      {id:'fts5',    x:284, y:375, w:108, h:42, color:'blue',  title:'FTS5',                 subs:['full-text search']},
+      {id:'minio',   x:406, y:375, w:88,  h:42, color:'amber', title:'MINIO',                subs:['object store']},
+    ],
+    edges:[
+      {from:'user',    to:'claude',  color:'blue'},
+      {from:'claude',  to:'membrain',color:'teal', label:'enriches'},
+      {from:'membrain',to:'helix',   color:'teal', label:'MCP calls'},
+      {from:'helix',   to:'forge',   color:'amber',label:'file writes'},
+      {from:'helix',   to:'prov',    color:'blue'},
+      {from:'helix',   to:'obs',     color:'green'},
+      {from:'helix',   to:'chroma',  color:'blue'},
+      {from:'helix',   to:'postgres',color:'blue'},
+      {from:'helix',   to:'minio',   color:'amber'},
+    ],
+    bands:[
+      {x:20,y:34,w:820,h:90,color:'rgba(59,130,246,0.03)',stroke:'rgba(59,130,246,0.12)',label:'INTERFACE LAYER',labelColor:'#3b82f6'},
+    ]
+  },
+  'd02': {
+    label:'02 — Containers',
+    sub:'Major deployable units',
+    nodes:[
+      {id:'helixapi', x:35,  y:85,  w:270, h:130,color:'teal',  title:'HELIX API',      subs:['FastAPI · Python 3.11','/mcp  StreamableHTTP · 20 tools','/api/v1  REST endpoints','routers: kb · exchange · write · intel']},
+      {id:'forge',    x:330, y:85,  w:265, h:130,color:'amber', title:'THE FORGE',       subs:['FastAPI · file workspace','CRUD · MinIO versioning','atom scanner (989 atoms)','molecule catalog (113 mols)']},
+      {id:'chroma',   x:35,  y:265, w:130, h:95, color:'blue',  title:'CHROMADB',        subs:['Vector search','semantic similarity','conversation chunks']},
+      {id:'postgres', x:185, y:265, w:130, h:95, color:'blue',  title:'POSTGRESQL',      subs:['Relational store','KB docs · ADRs','KG entities + edges']},
+      {id:'fts5',     x:335, y:265, w:130, h:95, color:'blue',  title:'FTS5 / SQLITE',   subs:['Full-text search','keyword queries','helix.db file']},
+      {id:'minio',    x:485, y:265, w:110, h:95, color:'amber', title:'MINIO',            subs:['Object store','file versions','S3-compatible']},
+      {id:'observer', x:35,  y:385, w:565, h:115,color:'green', title:'OBSERVER + HAIKU RECONCILER', subs:['Captures all tool call events → SQLite event log','Haiku reconciler cron (3:30 UTC): reads conversations → extracts decisions → writes files → KB indexed','Closes the loop: conversation content → searchable KB without manual writes']},
+      {id:'prov',     x:640, y:55,  w:205, h:100,color:'blue',  title:'PROVISIONER',     subs:['MCP registry','45 servers · 697 tools','routes tool calls to Helix']},
+      {id:'claudeai', x:640, y:175, w:205, h:80, color:'dim',   title:'CLAUDE.AI',        subs:['LLM · MCP host','calls tools via Provisioner']},
+    ],
+    edges:[
+      {from:'prov',    to:'helixapi', color:'blue',  label:'routes tool calls'},
+      {from:'helixapi',to:'chroma',   color:'blue'},
+      {from:'helixapi',to:'postgres', color:'blue'},
+      {from:'helixapi',to:'fts5',     color:'blue'},
+      {from:'helixapi',to:'forge',    color:'amber', label:'helix_file_write calls Forge'},
+      {from:'forge',   to:'minio',    color:'amber'},
+      {from:'helixapi',to:'observer', color:'green', stroke_dash:true},
+    ],
+    bands:[]
+  },
+  'd04': {
+    label:'04 — Write Pipeline',
+    sub:'helix_file_write 6 steps',
+    nodes:[
+      {id:'s1',x:15,  y:42,w:125,h:86,color:'teal', title:'① CALL',    subs:['helix_file_write','path + content args','via MCP tool']},
+      {id:'s2',x:158, y:42,w:125,h:86,color:'teal', title:'② WRITE',   subs:['Disk write','/opt/projects/ VPS1','SHA256 computed']},
+      {id:'s3',x:301, y:42,w:125,h:86,color:'amber',title:'③ VERSION', subs:['Forge → MinIO','snapshot stored','S3 key + timestamp']},
+      {id:'s4',x:444, y:42,w:125,h:86,color:'amber',title:'④ SCAN',    subs:['Atom scanner','pattern matching','molecule detection']},
+      {id:'s5',x:587, y:42,w:125,h:86,color:'blue', title:'⑤ INDEX',   subs:['KB indexing','FTS5 + ChromaDB','now searchable']},
+      {id:'s6',x:730, y:42,w:115,h:86,color:'blue', title:'⑥ KG + NOTIFY',subs:['Entity extract','PostgreSQL KG write','Observer event POST']},
+    ],
+    edges:[
+      {from:'s1',to:'s2',color:'teal'},
+      {from:'s2',to:'s3',color:'teal'},
+      {from:'s3',to:'s4',color:'amber'},
+      {from:'s4',to:'s5',color:'amber'},
+      {from:'s5',to:'s6',color:'blue'},
+    ],
+    bands:[]
+  },
+  'd05': {
+    label:'05 — Superloop',
+    sub:'AI memory cycle',
+    nodes:[
+      {id:'p1',x:320,y:40, w:220,h:68,color:'blue', title:'① USER SENDS',       subs:['new claude.ai session','MemBrain intercepts before POST']},
+      {id:'p2',x:640,y:118,w:200,h:68,color:'teal', title:'② MEMBRAIN INJECTS', subs:['tier-1 context prepended','recent sessions · active projects'],dash:true},
+      {id:'p3',x:670,y:256,w:175,h:68,color:'white',title:'③ CLAUDE ACTS',       subs:['calls Helix MCP tools','search · read · write · intel']},
+      {id:'p4',x:580,y:382,w:250,h:68,color:'amber',title:'④ HELIX WRITES',      subs:['helix_file_write pipeline (6 steps)','version · scan · index · KG · notify']},
+      {id:'p5',x:30, y:382,w:240,h:68,color:'green',title:'⑤ OBSERVER LOGS',     subs:['all events captured','Haiku reconciler cron · 3:30 UTC']},
+      {id:'p6',x:18, y:256,w:215,h:68,color:'blue', title:'⑥ HELIX ENRICHES',   subs:['semantic chunking','Chroma · FTS5 · KG updated']},
+      {id:'p7',x:18, y:118,w:230,h:68,color:'teal', title:'⑦ TIER-1 REBUILT',   subs:['context package assembled','ready for next session → ①']},
+    ],
+    edges:[
+      {from:'p1',to:'p2',color:'blue', curved:true},
+      {from:'p2',to:'p3',color:'teal'},
+      {from:'p3',to:'p4',color:'teal', curved:true},
+      {from:'p4',to:'p5',color:'amber',curved:true},
+      {from:'p5',to:'p6',color:'green'},
+      {from:'p6',to:'p7',color:'blue'},
+      {from:'p7',to:'p1',color:'teal', curved:true},
+    ],
+    bands:[]
+  },
+  'd03': {
+    label:'03 — Components',
+    sub:'Inside Helix Cortex API',
+    nodes:[
+      {id:'mcp_entry',x:310,y:18, w:240,h:46,color:'teal', title:'/mcp ENDPOINT',    subs:['StreamableHTTP · FastMCP · 20 registered tools']},
+      {id:'r_search', x:18, y:100,w:138,h:70,color:'teal', title:'SEARCH',            subs:['conv · kb · workdocs','entity · exchange']},
+      {id:'r_read',   x:175,y:100,w:138,h:70,color:'teal', title:'READ',              subs:['helix_file_read','workspace_read']},
+      {id:'r_write',  x:332,y:100,w:138,h:70,color:'teal', title:'WRITE ★',           subs:['helix_file_write','full pipeline (6 steps)']},
+      {id:'r_intel',  x:489,y:100,w:138,h:70,color:'teal', title:'INTELLIGENCE',      subs:['archive_record','entity · relationship']},
+      {id:'r_exch',   x:646,y:100,w:196,h:70,color:'teal', title:'EXCHANGE',          subs:['exchange_post · search','session log · retrieval']},
+      {id:'s_search', x:30, y:220,w:170,h:80,color:'blue', title:'SEARCH SVC',        subs:['Chroma semantic query','FTS5 keyword query','result fusion + ranking']},
+      {id:'s_kg',     x:220,y:220,w:170,h:80,color:'blue', title:'KG SERVICE',        subs:['entity_upsert','relationship_create','graph traversal']},
+      {id:'s_forge',  x:410,y:220,w:170,h:80,color:'amber',title:'FORGE CLIENT',      subs:['workspace_write → Forge','MinIO version trigger','atom scan trigger']},
+      {id:'s_obs',    x:600,y:220,w:240,h:80,color:'green',title:'OBSERVER CLIENT',   subs:['event POST on every write','tool call logging','session tagging + metadata']},
+      {id:'db_chroma',x:30, y:350,w:120,h:55,color:'blue', title:'ChromaDB',          subs:['vector · search']},
+      {id:'db_pg',    x:165,y:350,w:120,h:55,color:'blue', title:'PostgreSQL',        subs:['relational · KG']},
+      {id:'db_fts',   x:300,y:350,w:120,h:55,color:'blue', title:'FTS5 / SQLite',     subs:['helix.db · embedded']},
+      {id:'db_minio', x:435,y:350,w:120,h:55,color:'amber',title:'MinIO',             subs:['objects · versions']},
+      {id:'db_obs',   x:570,y:350,w:120,h:55,color:'green',title:'Observer DB',       subs:['events · sessions']},
+      {id:'db_forge', x:705,y:350,w:130,h:55,color:'amber',title:'Forge Workspace',   subs:['files · patterns']},
+    ],
+    edges:[
+      {from:'mcp_entry',to:'r_search',color:'teal'},
+      {from:'mcp_entry',to:'r_read',  color:'teal'},
+      {from:'mcp_entry',to:'r_write', color:'teal'},
+      {from:'mcp_entry',to:'r_intel', color:'teal'},
+      {from:'mcp_entry',to:'r_exch',  color:'teal'},
+      {from:'r_search', to:'s_search',color:'blue'},
+      {from:'r_write',  to:'s_forge', color:'amber'},
+      {from:'r_intel',  to:'s_kg',    color:'blue'},
+      {from:'r_exch',   to:'s_obs',   color:'green'},
+      {from:'s_search', to:'db_chroma',color:'blue'},
+      {from:'s_search', to:'db_pg',   color:'blue'},
+      {from:'s_search', to:'db_fts',  color:'blue'},
+      {from:'s_forge',  to:'db_minio',color:'amber'},
+      {from:'s_forge',  to:'db_forge',color:'amber'},
+      {from:'s_obs',    to:'db_obs',  color:'green'},
+      {from:'s_kg',     to:'db_pg',   color:'blue'},
+    ],
+    bands:[
+      {x:10,y:88,w:848,h:94,color:'rgba(0,212,170,0.02)',stroke:'rgba(0,212,170,0.1)',label:'ROUTER LAYER',labelColor:'#5a6472'},
+      {x:10,y:208,w:848,h:104,color:'rgba(59,130,246,0.02)',stroke:'rgba(59,130,246,0.08)',label:'SERVICE LAYER',labelColor:'#5a6472'},
+      {x:10,y:338,w:848,h:80, color:'rgba(59,130,246,0.02)',stroke:'rgba(59,130,246,0.06)',label:'STORAGE LAYER',labelColor:'#5a6472'},
+    ]
+  }
+};
+
+const NODE_COLORS = {
+  teal:  {bg:'#1a1f26',border:'rgba(0,212,170,.5)',  bw:'1.5px',title:'#00d4aa',sub:'#5a6472'},
+  blue:  {bg:'#1a1f26',border:'rgba(59,130,246,.4)', bw:'1px',  title:'#3b82f6',sub:'#5a6472'},
+  amber: {bg:'#1a1f26',border:'rgba(245,158,11,.45)',bw:'1.5px',title:'#f59e0b',sub:'#5a6472'},
+  green: {bg:'#1a1f26',border:'rgba(34,197,94,.4)',  bw:'1.5px',title:'#22c55e',sub:'#5a6472'},
+  dim:   {bg:'#1a1f26',border:'rgba(255,255,255,.1)',bw:'1px',  title:'#e8edf3',sub:'#5a6472'},
+  white: {bg:'#1a1f26',border:'rgba(255,255,255,.12)',bw:'1px', title:'#e8edf3',sub:'#5a6472'},
+};
+const EDGE_COLORS = {teal:'#00d4aa',blue:'#3b82f6',amber:'#f59e0b',green:'#22c55e',dim:'#5a6472',white:'#e8edf3'};
+const COLOR_NAMES = ['teal','blue','amber','green','dim','white'];
+
+let state = {nodes:[],edges:[],bands:[]};
+let history = [];
+let selectedId = null;
+let connectMode = false;
+let connectFrom = null;
+let activeDiag = null;
+
+// ─────────────────────────────────────────────────
+// DIAGRAM LIST
+// ─────────────────────────────────────────────────
+function buildDiagList() {
+  const el = document.getElementById('diag-list');
+  el.innerHTML = '';
+  Object.entries(DIAGRAMS).forEach(([key,d]) => {
+    const item = document.createElement('div');
+    item.className = 'diag-list-item';
+    item.id = 'dli-'+key;
+    item.innerHTML = `<div class="dli-title">${d.label}</div><div class="dli-sub">${d.sub}</div>`;
+    item.onclick = () => loadDiagram(key);
+    el.appendChild(item);
+  });
+}
+
+function loadDiagram(key) {
+  // Save current before switching
+  if (activeDiag) DIAGRAMS[activeDiag] = deepClone(state);
+  activeDiag = key;
+  history = [];
+  document.querySelectorAll('.diag-list-item').forEach(el=>el.classList.remove('active'));
+  document.getElementById('dli-'+key)?.classList.add('active');
+  const d = DIAGRAMS[key];
+  state = deepClone({nodes:d.nodes, edges:d.edges, bands:d.bands||[]});
+  selectNode(null);
+  renderAll();
+  setStatus('loaded '+d.label);
+}
+
+// ─────────────────────────────────────────────────
+// RENDER
+// ─────────────────────────────────────────────────
+function renderAll() {
+  const canvas = document.getElementById('canvas-inner');
+  // remove existing nodes + bands (keep svg)
+  canvas.querySelectorAll('.node,.layer-band,.layer-label').forEach(el=>el.remove());
+  // expand canvas
+  const maxX = Math.max(860, ...state.nodes.map(n=>n.x+n.w)) + 80;
+  const maxY = Math.max(560, ...state.nodes.map(n=>n.y+n.h)) + 80;
+  canvas.style.width  = maxX+'px';
+  canvas.style.height = maxY+'px';
+  const svg = document.getElementById('arrows-svg');
+  svg.style.width  = maxX+'px';
+  svg.style.height = maxY+'px';
+  // bands
+  state.bands.forEach((b,i) => renderBand(b,i));
+  // nodes
+  state.nodes.forEach(n => renderNode(n));
+  // arrows
+  drawArrows();
+}
+
+function renderBand(b,i) {
+  const canvas = document.getElementById('canvas-inner');
+  const div = document.createElement('div');
+  div.className = 'layer-band';
+  div.style.cssText = `left:${b.x}px;top:${b.y}px;width:${b.w}px;height:${b.h}px;background:${b.color};border:1px dashed ${b.stroke};border-radius:3px`;
+  canvas.appendChild(div);
+  const lbl = document.createElement('div');
+  lbl.className = 'layer-label';
+  lbl.style.cssText = `left:${b.x+14}px;top:${b.y+10}px;font-size:8px;letter-spacing:.15em;color:${b.labelColor}`;
+  lbl.textContent = b.label;
+  canvas.appendChild(lbl);
+}
+
+function renderNode(n) {
+  const canvas = document.getElementById('canvas-inner');
+  const c = NODE_COLORS[n.color] || NODE_COLORS.dim;
+  const el = document.createElement('div');
+  el.className = 'node' + (n.id===selectedId?' selected':'');
+  el.id = 'node-'+n.id;
+  el.style.cssText = `left:${n.x}px;top:${n.y}px;width:${n.w}px;height:${n.h}px;background:${c.bg};border:${c.bw} ${n.dash?'dashed':'solid'} ${c.border}`;
+  el.innerHTML = `<div class="node-inner"><div class="node-title" style="color:${c.title}">${n.title}</div><div class="node-sub">${(n.subs||[]).map(s=>`<span>${s}</span>`).join('')}</div></div>`;
+  makeDraggable(el, n);
+  el.addEventListener('click', e => { e.stopPropagation(); handleNodeClick(n); });
+  el.addEventListener('dblclick', e => { e.stopPropagation(); selectNode(n.id); openProps(n); });
+  canvas.appendChild(el);
+}
+
+function drawArrows() {
+  const svg = document.getElementById('arrows-svg');
+  svg.querySelectorAll('.edge-g').forEach(el=>el.remove());
+  state.edges.forEach((e,i) => {
+    const na = state.nodes.find(n=>n.id===e.from);
+    const nb = state.nodes.find(n=>n.id===e.to);
+    if (!na||!nb) return;
+    const ax=na.x+na.w/2, ay=na.y+na.h/2, bx=nb.x+nb.w/2, by=nb.y+nb.h/2;
+    let d, lx, ly;
+    if (e.curved) {
+      const mx=(ax+bx)/2, my=(ay+by)/2;
+      const dx=bx-ax, dy=by-ay;
+      const cx=mx-dy*0.35, cy=my+dx*0.35;
+      d=`M${ax},${ay} Q${cx},${cy} ${bx},${by}`;
+      lx=cx; ly=cy;
+    } else {
+      d=`M${ax},${ay} L${bx},${by}`;
+      lx=(ax+bx)/2; ly=(ay+by)/2;
+    }
+    const sc = EDGE_COLORS[e.color]||'#5a6472';
+    const g = document.createElementNS('http://www.w3.org/2000/svg','g');
+    g.className.baseVal='edge-g';
+    g.dataset.idx = i;
+    const path = document.createElementNS('http://www.w3.org/2000/svg','path');
+    path.setAttribute('d',d);
+    path.setAttribute('stroke',sc);
+    path.setAttribute('stroke-width','1.5');
+    path.setAttribute('fill','none');
+    path.setAttribute('marker-end',`url(#arr-${e.color||'dim'})`);
+    if (e.stroke_dash) path.setAttribute('stroke-dasharray','4,3');
+    path.style.cursor='pointer';
+    path.addEventListener('click', ev => { ev.stopPropagation(); deleteEdge(i); });
+    path.setAttribute('stroke-opacity','0.85');
+    g.appendChild(path);
+    if (e.label) {
+      const txt = document.createElementNS('http://www.w3.org/2000/svg','text');
+      txt.setAttribute('x',lx); txt.setAttribute('y',ly-5);
+      txt.setAttribute('text-anchor','middle');
+      txt.setAttribute('fill',sc); txt.setAttribute('font-size','8');
+      txt.setAttribute('font-family',"'IBM Plex Mono',monospace");
+      txt.textContent = e.label;
+      g.appendChild(txt);
+    }
+    svg.appendChild(g);
+  });
+}
+
+// ─────────────────────────────────────────────────
+// INTERACTION
+// ─────────────────────────────────────────────────
+function makeDraggable(el, n) {
+  let ox, oy, moved=false;
+  el.addEventListener('pointerdown', e => {
+    if (connectMode) return;
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    ox=e.clientX-n.x; oy=e.clientY-n.y; moved=false;
+    const mm = ev => {
+      moved=true;
+      n.x = Math.max(0, ev.clientX-ox);
+      n.y = Math.max(0, ev.clientY-oy);
+      el.style.left=n.x+'px'; el.style.top=n.y+'px';
+      drawArrows();
+    };
+    const mu = () => {
+      el.removeEventListener('pointermove',mm);
+      el.removeEventListener('pointerup',mu);
+      if (moved) pushHistory();
+    };
+    el.addEventListener('pointermove',mm);
+    el.addEventListener('pointerup',mu);
+  });
+}
+
+function handleNodeClick(n) {
+  if (connectMode) {
+    if (!connectFrom) {
+      connectFrom = n.id;
+      document.getElementById('node-'+n.id)?.classList.add('connect-source');
+      setStatus('click target node...');
+      return;
+    }
+    if (connectFrom !== n.id) {
+      pushHistory();
+      state.edges.push({from:connectFrom, to:n.id, color:'teal'});
+      drawArrows();
+      setStatus('connected '+connectFrom+' → '+n.id);
+    }
+    document.getElementById('node-'+connectFrom)?.classList.remove('connect-source');
+    connectFrom = null;
+    return;
+  }
+  selectNode(n.id);
+}
+
+function selectNode(id) {
+  document.querySelectorAll('.node').forEach(el=>el.classList.remove('selected'));
+  selectedId = id;
+  if (id) {
+    document.getElementById('node-'+id)?.classList.add('selected');
+    const n = state.nodes.find(n=>n.id===id);
+    if (n) openProps(n);
+  } else {
+    document.getElementById('props-empty').style.display='block';
+    document.getElementById('props-node').style.display='none';
+  }
+  renderEdgeList();
+}
+
+document.getElementById('canvas-wrap').addEventListener('click', () => selectNode(null));
+
+// ─────────────────────────────────────────────────
+// PROPERTIES PANEL
+// ─────────────────────────────────────────────────
+function openProps(n) {
+  document.getElementById('props-empty').style.display='none';
+  document.getElementById('props-node').style.display='block';
+  document.getElementById('p-title').value = n.title;
+  document.getElementById('p-subs').value = (n.subs||[]).join('\n');
+  document.getElementById('p-dash').value = n.dash?'dashed':'solid';
+  document.getElementById('p-w').value = n.w;
+  document.getElementById('p-h').value = n.h;
+  buildColorGrid(n);
+  renderEdgeList();
+}
+
+function buildColorGrid(n) {
+  const grid = document.getElementById('color-grid');
+  grid.innerHTML = '';
+  const colorLabels = {teal:'teal',blue:'blue',amber:'amber',green:'green',dim:'dim',white:'white'};
+  const colorBgs = {teal:'rgba(0,212,170,.15)',blue:'rgba(59,130,246,.15)',amber:'rgba(245,158,11,.15)',green:'rgba(34,197,94,.15)',dim:'rgba(255,255,255,.08)',white:'rgba(255,255,255,.08)'};
+  const colorFg = {teal:'#00d4aa',blue:'#3b82f6',amber:'#f59e0b',green:'#22c55e',dim:'#c8d0db',white:'#e8edf3'};
+  COLOR_NAMES.forEach(c => {
+    const sw = document.createElement('div');
+    sw.className = 'color-swatch' + (n.color===c?' active':'');
+    sw.style.background = colorBgs[c];
+    sw.style.color = colorFg[c];
+    sw.textContent = c;
+    sw.onclick = () => { pushHistory(); n.color=c; refreshNode(n); buildColorGrid(n); };
+    grid.appendChild(sw);
+  });
+}
+
+function applyPropTitle() {
+  const n = state.nodes.find(n=>n.id===selectedId); if(!n) return;
+  n.title = document.getElementById('p-title').value;
+  refreshNode(n);
+}
+function applyPropSubs() {
+  const n = state.nodes.find(n=>n.id===selectedId); if(!n) return;
+  n.subs = document.getElementById('p-subs').value.split('\n').filter(Boolean);
+  refreshNode(n);
+}
+function applyPropDash() {
+  const n = state.nodes.find(n=>n.id===selectedId); if(!n) return;
+  n.dash = document.getElementById('p-dash').value==='dashed';
+  refreshNode(n);
+}
+function applyPropSize() {
+  const n = state.nodes.find(n=>n.id===selectedId); if(!n) return;
+  const w = parseInt(document.getElementById('p-w').value);
+  const h = parseInt(document.getElementById('p-h').value);
+  if (!isNaN(w)&&w>20) n.w=w;
+  if (!isNaN(h)&&h>20) n.h=h;
+  refreshNode(n);
+}
+
+function refreshNode(n) {
+  const existing = document.getElementById('node-'+n.id);
+  if (existing) existing.remove();
+  renderNode(n);
+  drawArrows();
+}
+
+function renderEdgeList() {
+  const el = document.getElementById('edge-list');
+  el.innerHTML = '';
+  const connected = state.edges.filter(e=>e.from===selectedId||e.to===selectedId);
+  if (!connected.length) {
+    el.innerHTML = '<div style="font-size:9px;color:var(--text-dim);padding:4px 0">no connections</div>';
+    return;
+  }
+  connected.forEach((e,_) => {
+    const idx = state.edges.indexOf(e);
+    const item = document.createElement('div');
+    item.className = 'edge-item';
+    const dot = document.createElement('div');
+    dot.className = 'edge-dot';
+    dot.style.background = EDGE_COLORS[e.color]||'#5a6472';
+    const lbl = document.createElement('span');
+    lbl.textContent = `${e.from} → ${e.to}`;
+    const del = document.createElement('span');
+    del.textContent = '✕';
+    del.style.cssText = 'margin-left:auto;color:var(--danger);cursor:pointer;font-size:10px';
+    del.onclick = () => deleteEdge(idx);
+    item.appendChild(dot); item.appendChild(lbl); item.appendChild(del);
+    el.appendChild(item);
+  });
+}
+
+// ─────────────────────────────────────────────────
+// TOOLBAR ACTIONS
+// ─────────────────────────────────────────────────
+function addNode() {
+  pushHistory();
+  const id = 'n'+Date.now();
+  const n = {id, x:100, y:100, w:160, h:70, color:'dim', title:'NEW NODE', subs:['subtitle line']};
+  state.nodes.push(n);
+  renderNode(n);
+  selectNode(id);
+  setStatus('added node — dbl-click to edit');
+}
+
+function deleteSelected() {
+  if (!selectedId) return;
+  pushHistory();
+  state.nodes = state.nodes.filter(n=>n.id!==selectedId);
+  state.edges = state.edges.filter(e=>e.from!==selectedId&&e.to!==selectedId);
+  document.getElementById('node-'+selectedId)?.remove();
+  drawArrows();
+  selectNode(null);
+  setStatus('deleted');
+}
+
+function deleteEdge(idx) {
+  pushHistory();
+  state.edges.splice(idx,1);
+  drawArrows();
+  renderEdgeList();
+  setStatus('edge removed — click edge to remove');
+}
+
+function toggleConnect() {
+  connectMode = !connectMode;
+  connectFrom = null;
+  document.querySelectorAll('.node').forEach(el=>el.classList.remove('connect-source'));
+  const btn = document.getElementById('btn-connect');
+  btn.classList.toggle('active', connectMode);
+  btn.textContent = connectMode ? '✓ connecting' : 'connect';
+  document.getElementById('canvas-wrap').style.cursor = connectMode ? 'crosshair' : 'default';
+  setStatus(connectMode ? 'click source node...' : 'connect mode off');
+}
+
+function toggleBand() {
+  pushHistory();
+  const b = {x:50,y:50,w:400,h:200,color:'rgba(0,212,170,0.03)',stroke:'rgba(0,212,170,0.2)',label:'NEW LAYER',labelColor:'#00d4aa'};
+  state.bands.push(b);
+  renderBand(b, state.bands.length-1);
+  setStatus('band added — edit source to reposition');
+}
+
+// ─────────────────────────────────────────────────
+// HISTORY
+// ─────────────────────────────────────────────────
+function pushHistory() {
+  history.push(deepClone(state));
+  if (history.length > 30) history.shift();
+}
+function undo() {
+  if (!history.length) return;
+  state = history.pop();
+  selectedId = null;
+  renderAll();
+  setStatus('undo');
+}
+
+// ─────────────────────────────────────────────────
+// EXPORT
+// ─────────────────────────────────────────────────
+function openExport() {
+  if (activeDiag) DIAGRAMS[activeDiag] = deepClone(state);
+  const out = {
+    diagram: activeDiag,
+    nodes: state.nodes.map(n=>({id:n.id,x:Math.round(n.x),y:Math.round(n.y),w:n.w,h:n.h,color:n.color,title:n.title,subs:n.subs,dash:n.dash||false})),
+    edges: state.edges.map(e=>({from:e.from,to:e.to,color:e.color,label:e.label||'',curved:e.curved||false})),
+    bands: state.bands,
+  };
+  document.getElementById('modal-pre').textContent = JSON.stringify(out,null,2);
+  document.getElementById('modal-bg').classList.add('open');
+}
+function closeModal() { document.getElementById('modal-bg').classList.remove('open'); }
+function copyExport() {
+  const txt = document.getElementById('modal-pre').textContent;
+  navigator.clipboard.writeText(txt).then(()=>setStatus('copied to clipboard'));
+}
+
+// ─────────────────────────────────────────────────
+// UTILS
+// ─────────────────────────────────────────────────
+function setStatus(msg) {
+  document.getElementById('status-txt').textContent = msg;
+  setTimeout(()=>document.getElementById('status-txt').textContent='ready',3000);
+}
+function deepClone(o) { return JSON.parse(JSON.stringify(o)); }
+
+// Keyboard shortcuts
+document.addEventListener('keydown', e => {
+  if (e.key==='Delete'||e.key==='Backspace') { if(selectedId&&document.activeElement===document.body) deleteSelected(); }
+  if (e.key==='Escape') { if(connectMode) toggleConnect(); selectNode(null); }
+  if ((e.ctrlKey||e.metaKey)&&e.key==='z') { e.preventDefault(); undo(); }
+  if ((e.ctrlKey||e.metaKey)&&e.key==='e') { e.preventDefault(); openExport(); }
+});
+
+// Close modal on bg click
+document.getElementById('modal-bg').addEventListener('click', e => { if(e.target===document.getElementById('modal-bg')) closeModal(); });
+
+// Boot
+buildDiagList();
+loadDiagram('d06');
+</script>
+</body>
+</html>
