@@ -164,6 +164,43 @@ services:
       retries: 3
       start_period: 120s
 
+  # --- Transcript Bridge ---
+  # Receives Claude conversation transcripts from MemBrain extension.
+  # Stores raw JSON backup, forwards to helix-cortex for ingestion.
+  transcript-bridge:
+    build: ./transcript-bridge
+    container_name: transcript-bridge
+    restart: unless-stopped
+    ports:
+      - "8097:8099"
+    environment:
+      HELIX_URL: http://helix-cortex:9050
+      BRIDGE_API_KEY: ${BRIDGE_API_KEY:-bridge-dev-key}
+    volumes:
+      - transcript-bridge-data:/app/data
+    networks:
+      - helix
+      - coolify
+    depends_on:
+      helix-cortex:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=coolify"
+      - "traefik.http.routers.transcript-bridge.rule=Host(`bridge.millyweb.com`)"
+      - "traefik.http.routers.transcript-bridge.entrypoints=https"
+      - "traefik.http.routers.transcript-bridge.tls.certresolver=letsencrypt"
+      - "traefik.http.services.transcript-bridge.loadbalancer.server.port=8099"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8099/')"] 
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  transcript-bridge-data:
+
 networks:
   coolify:
     external: true
