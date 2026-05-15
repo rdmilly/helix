@@ -17,7 +17,7 @@ async def build_similarity_clusters(limit: int = 500) -> int:
     meta = get_meta_service()
 
     with db.get_connection() as conn:
-        unclustered = conn.execute("""
+        cur = conn.execute("""
             SELECT a.id, a.name
             FROM atoms a
             JOIN embeddings e ON e.source_id = a.id AND e.source_type = 'atoms'
@@ -27,7 +27,8 @@ async def build_similarity_clusters(limit: int = 500) -> int:
                 WHERE m.target_id = a.id AND m.namespace = 'similarity_cluster'
             )
             LIMIT %s
-        """, (limit,)).fetchall()
+        """, (limit,))
+        unclustered = cur.fetchall()
 
     if not unclustered:
         log.info('similarity_cluster: all atoms clustered')
