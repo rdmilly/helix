@@ -500,3 +500,75 @@ async def _summarize_conversations(
 @router.get("/health")
 async def ext_health():
     return {"status": "ok", "endpoint": "/api/v1/ext/ingest", "accepts": "turn_array"}
+
+
+# ---------------------------------------------------------------------------
+# Memory Import — receives Claude's own memory summaries from MemBrain backfill
+# Stores as Tier 2 session summaries; Haiku extraction pass runs on top later.
+# ---------------------------------------------------------------------------
+
+class MemoryImportRequest(BaseModel):
+    summaries: list = []
+    memories:  list = []
+    source:    str  = "claude.ai"
+    importedAt: str = ""
+
+
+@router.post("/memory-import")
+async def ext_memory_import(req: MemoryImportRequest):
+    """Receive Claude.ai memory summaries from MemBrain backfill worker.
+
+    Summaries seed the Tier 2 layer (sessions.summary) for conversations
+    that have been captured but not yet processed by the Haiku extraction pass.
+    """
+    imported = 0
+    skipped  = 0
+    try:
+        from services.pg_sync import get_pg_conn
+        with get_pg_conn() as conn:
+            for item in (req.summaries + req.memories):
+                if not item:
+                    continue
+                # Each item may be a dict with conv_id + summary, or a raw string
+                if isinstance(item, dict):
+                    conv_id = item.get("conversation_id") or item.get("id")
+                    summary = item.get("summary") or item.get("text") or str(item)
+                else:
+                    conv_id = None
+                    summary = str(item)
+
+                if not summary or not summary.strip():
+                    skipped += 1
+                    continue
+
+                if conv_id:
+                    # Update existing session if it exists
+                    result = conn.execute(
+                        "UPDATE sessions SET summary = %s WHERE id = %s AND (summary IS NULL OR summary = '')",
+                        (summary[:4000], conv_id)
+                    )
+                    if result.rowcount == 0:
+                        # Insert as new session entry
+                        conn.execute(
+                            """INSERT INTO sessions (id, provider, summary, user_id, tenant_id, created_at)
+                               VALUES (%s, %s, %s, 'system', 'system', now())
+                               ON CONFLICT (id) DO NOTHING""",
+                            (conv_id, req.source, summary[:4000])
+                        )
+                else:
+                    # No conv_id — store as a generic memory note in session_journal
+                    conn.execute(
+                        """INSERT INTO session_journal
+                               (session_id, topic, node, raw_handoff, ts)
+                           VALUES (%s, 'memory-import', 'claude.ai', %s, now())""",
+                        (f"memory-import-{imported}", summary[:4000])
+                    )
+                conn.commit()
+                imported += 1
+
+    except Exception as e:
+        logger.error(f"[ext_memory_import] failed: {e}")
+        return {"status": "error", "error": str(e), "imported": imported}
+
+    logger.info(f"[ext_memory_import] imported={imported} skipped={skipped} source={req.source}")
+    return {"status": "ok", "imported": imported, "skipped": skipped}
