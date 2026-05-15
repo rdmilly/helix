@@ -152,9 +152,10 @@ services:
     container_name: helix-embeddings
     restart: unless-stopped
     environment:
-      EMBEDDING_MODEL: BAAI/bge-large-en-v1.5
+      MODEL_PATH: /models/models--qdrant--bge-large-en-v1.5-onnx/snapshots/dc76b2c078fc38f0d243233d0ab0b51de925557e
+      OMP_NUM_THREADS: "2"
     volumes:
-      - ./embeddings-cache:/root/.cache
+      - /opt/data/helix/data/models:/models:ro
     networks:
       - helix
     healthcheck:
@@ -162,7 +163,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 120s
+      start_period: 30s
 
   # --- Transcript Bridge ---
   # Receives Claude conversation transcripts from MemBrain extension.
