@@ -1,29 +1,22 @@
-# Helix — Unified Stack
-# All services that form the Helix intelligence platform.
-# Networks follow the canonical 4-network pattern (Paving Agent v0.3 PRD A4):
-#   apps  = application containers that talk to each other (T2)
-#   data  = databases and stateful stores only (T4)
-#   mcp   = MCP servers + gateway layer (T3)
-#   edge  = Traefik <-> public-facing services (T1)
-
 services:
-
-  # ============================================================
-  # SECRETS & CONFIG
-  # ============================================================
-
   helix-infisical-agent:
     image: infisical/cli:latest
     container_name: helix-infisical-agent
     restart: unless-stopped
-    entrypoint: ["/bin/sh", "/config/infisical-entrypoint.sh"]
+    entrypoint:
+    - /bin/sh
+    - /config/infisical-entrypoint.sh
     volumes:
-      - ./infisical-entrypoint.sh:/config/infisical-entrypoint.sh:ro
-      - ./secrets:/secrets
+    - ./infisical-entrypoint.sh:/config/infisical-entrypoint.sh:ro
+    - ./secrets:/secrets
     networks:
-      - apps
+    - apps
     healthcheck:
-      test: ["CMD", "sh", "-c", "test -s /secrets/helix.env && grep -q ANTHROPIC_API_KEY /secrets/helix.env"]
+      test:
+      - CMD
+      - sh
+      - -c
+      - test -s /secrets/helix.env && grep -q ANTHROPIC_API_KEY /secrets/helix.env
       interval: 10s
       timeout: 5s
       retries: 18
@@ -32,11 +25,6 @@ services:
       resources:
         limits:
           memory: 128M
-
-  # ============================================================
-  # DATA PLANE (T4) — data network only
-  # ============================================================
-
   helix-postgres:
     image: pgvector/pgvector:pg16
     container_name: helix-postgres
@@ -46,17 +34,18 @@ services:
       POSTGRES_USER: helix
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
-      - /opt/data/helix/postgres-data:/var/lib/postgresql/data
+    - /opt/data/helix/postgres-data:/var/lib/postgresql/data
     ports:
-      - "9037:5432"
+    - 9037:5432
     networks:
-      - data
+    - data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U helix"]
+      test:
+      - CMD-SHELL
+      - pg_isready -U helix
       interval: 10s
       timeout: 5s
       retries: 5
-
   helix-neo4j:
     image: neo4j:5.18-community
     container_name: helix-neo4j
@@ -66,63 +55,74 @@ services:
       NEO4J_server_memory_heap_max__size: 512m
       NEO4J_server_memory_pagecache_size: 256m
     volumes:
-      - ./neo4j-data:/data
+    - ./neo4j-data:/data
     ports:
-      - "9038:7474"
-      - "9039:7687"
+    - 9038:7474
+    - 9039:7687
     networks:
-      - data
+    - data
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      test:
+      - CMD-SHELL
+      - wget -q --spider http://localhost:7474 || exit 1
       interval: 20s
       timeout: 10s
       retries: 5
       start_period: 30s
-
   helix-redis:
     image: redis:7-alpine
     container_name: helix-redis
     restart: unless-stopped
     command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
     networks:
-      - data
+    - data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test:
+      - CMD
+      - redis-cli
+      - ping
       interval: 10s
       timeout: 3s
       retries: 3
-
   helix-chromadb:
     image: chromadb/chroma:0.5.23
     container_name: helix-chromadb
     restart: unless-stopped
     volumes:
-      - ./chromadb-data:/chroma/chroma
+    - ./chromadb-data:/chroma/chroma
     environment:
-      - ANONYMIZED_TELEMETRY=False
+    - ANONYMIZED_TELEMETRY=False
     networks:
-      - data
+    - data
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8000"]
+      test:
+      - CMD
+      - bash
+      - -c
+      - exec 3<>/dev/tcp/localhost/8000
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 15s
-
   helix-garage:
     image: dxflrs/garage:v1.0.1
     container_name: helix-garage
     restart: unless-stopped
     environment:
-      - GARAGE_RPC_SECRET=${GARAGE_RPC_SECRET}
+    - GARAGE_RPC_SECRET=${GARAGE_RPC_SECRET}
     volumes:
-      - /opt/projects/the-forge/garage.toml:/etc/garage.toml:ro
-      - garage-data:/var/lib/garage/data
-      - garage-meta:/var/lib/garage/meta
+    - /opt/projects/the-forge/garage.toml:/etc/garage.toml:ro
+    - garage-data:/var/lib/garage/data
+    - garage-meta:/var/lib/garage/meta
     networks:
-      - apps
+    - apps
     healthcheck:
-      test: ["CMD", "/garage", "-c", "/etc/garage.toml", "status"]
+      test:
+      - CMD
+      - /garage
+      - -c
+      - /etc/garage.toml
+      - status
       interval: 30s
       timeout: 10s
       retries: 3
@@ -131,45 +131,43 @@ services:
       resources:
         limits:
           memory: 128M
-
-  # ============================================================
-  # APPLICATION LAYER (T2) — apps + data networks
-  # ============================================================
-
   helix-embeddings:
     build: ./services/embeddings
     container_name: helix-embeddings
     restart: unless-stopped
     environment:
       MODEL_PATH: /models/models--qdrant--bge-large-en-v1.5-onnx/snapshots/dc76b2c078fc38f0d243233d0ab0b51de925557e
-      OMP_NUM_THREADS: "2"
+      OMP_NUM_THREADS: '2'
     volumes:
-      - /opt/data/helix/data/models:/models:ro
+    - /opt/data/helix/data/models:/models:ro
     networks:
-      - apps
-      - data
+    - apps
+    - data
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test:
+      - CMD
+      - python3
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://localhost:8000/health')
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
-
   helix-cortex:
     build: .
     container_name: helix-cortex
     restart: unless-stopped
     ports:
-      - "9050:9050"
+    - 9050:9050
     volumes:
-      - /opt/data/helix:/app/data
-      - /opt/projects:/opt/projects:ro
+    - /opt/data/helix:/app/data
+    - /opt/projects:/opt/projects:ro
     env_file:
-      - ./secrets/helix.env
+    - ./secrets/helix.env
     networks:
-      - apps
-      - data
-      - mcp
+    - apps
+    - data
+    - mcp
     depends_on:
       helix-infisical-agent:
         condition: service_healthy
@@ -178,147 +176,118 @@ services:
       helix-embeddings:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9050/health')"]
+      test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://localhost:9050/health')
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 5s
     labels:
-      - "traefik.enable=true"
-      - "traefik.docker.network=apps"
-      - "traefik.http.routers.helix.rule=Host(`helix.millyweb.com`)"
-      - "traefik.http.routers.helix.entrypoints=https"
-      - "traefik.http.routers.helix.tls.certresolver=letsencrypt"
-      - "traefik.http.services.helix.loadbalancer.server.port=9050"
-
+    - traefik.enable=true
+    - traefik.docker.network=apps
+    - traefik.http.routers.helix.rule=Host(`helix.millyweb.com`)
+    - traefik.http.routers.helix.entrypoints=https
+    - traefik.http.routers.helix.tls.certresolver=letsencrypt
+    - traefik.http.services.helix.loadbalancer.server.port=9050
   the-forge:
     build: /opt/projects/the-forge
     container_name: the-forge
     restart: unless-stopped
     ports:
-      - "9095:9095"
+    - 9095:9095
     environment:
-      - PORT=9095
-      - DATA_DIR=/app/data
-      - WORKSPACE_ROOT=/workspace
-      - STORAGE_ENDPOINT=helix-garage:3900
-      - STORAGE_ACCESS_KEY=${GARAGE_ACCESS_KEY}
-      - STORAGE_SECRET_KEY=${GARAGE_SECRET_KEY}
-      - STORAGE_BUCKET=workspace
-      - STORAGE_SECURE=false
-      - HELIX_URL=http://helix-cortex:9050
+    - PORT=9095
+    - DATA_DIR=/app/data
+    - WORKSPACE_ROOT=/workspace
+    - STORAGE_ENDPOINT=helix-garage:3900
+    - STORAGE_ACCESS_KEY=${GARAGE_ACCESS_KEY}
+    - STORAGE_SECRET_KEY=${GARAGE_SECRET_KEY}
+    - STORAGE_BUCKET=workspace
+    - STORAGE_SECURE=false
+    - HELIX_URL=http://helix-cortex:9050
     volumes:
-      - forge-data:/app/data
-      - forge-workspace:/workspace
-      - /opt/projects:/projects:rw
+    - forge-data:/app/data
+    - forge-workspace:/workspace
+    - /opt/projects:/projects:rw
     networks:
-      - apps
-      - mcp
+    - apps
+    - mcp
     depends_on:
       helix-garage:
         condition: service_healthy
       helix-cortex:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9095/health')"]
+      test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://localhost:9095/health')
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
     labels:
-      - "traefik.enable=true"
-      - "traefik.docker.network=apps"
-      - "traefik.http.routers.forge.rule=Host(`forge.millyweb.com`)"
-      - "traefik.http.routers.forge.entrypoints=https"
-      - "traefik.http.routers.forge.tls.certresolver=letsencrypt"
-      - "traefik.http.services.forge.loadbalancer.server.port=9095"
-
+    - traefik.enable=true
+    - traefik.docker.network=apps
+    - traefik.http.routers.forge.rule=Host(`forge.millyweb.com`)
+    - traefik.http.routers.forge.entrypoints=https
+    - traefik.http.routers.forge.tls.certresolver=letsencrypt
+    - traefik.http.services.forge.loadbalancer.server.port=9095
   transcript-bridge:
     build: ./transcript-bridge
     container_name: transcript-bridge
     restart: unless-stopped
     ports:
-      - "8097:8099"
+    - 8097:8099
     environment:
       HELIX_URL: http://helix-cortex:9050
       BRIDGE_API_KEY: ${BRIDGE_API_KEY:-bridge-dev-key}
     volumes:
-      - transcript-bridge-data:/app/data
+    - transcript-bridge-data:/app/data
     networks:
-      - apps
-      - edge
+    - apps
+    - edge
     depends_on:
       helix-cortex:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8099/')"]
+      test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://localhost:8099/')
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 15s
     labels:
-      - "traefik.enable=true"
-      - "traefik.docker.network=apps"
-      - "traefik.http.routers.transcript-bridge.rule=Host(`bridge.millyweb.com`)"
-      - "traefik.http.routers.transcript-bridge.entrypoints=https"
-      - "traefik.http.routers.transcript-bridge.tls.certresolver=letsencrypt"
-      - "traefik.http.services.transcript-bridge.loadbalancer.server.port=8099"
-
-  millyext-receiver:
-    build: /opt/projects/millyext-receiver
-    container_name: millyext-receiver
-    restart: unless-stopped
-    ports:
-      - "8099:8099"
-    volumes:
-      - millyext-data:/data
-    environment:
-      - MILLYEXT_API_KEY=${MILLYEXT_API_KEY:-milly-dev-key}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - GOOGLE_PLACES_KEY=${GOOGLE_PLACES_KEY}
-      - DB_HOST=helix-postgres
-      - DB_PORT=5432
-      - DB_NAME=leads
-      - DB_USER=helix
-      - DB_PASS=${POSTGRES_PASSWORD}
-    networks:
-      - apps
-      - data
-    depends_on:
-      helix-postgres:
-        condition: service_healthy
-    labels:
-      - "traefik.enable=true"
-      - "traefik.docker.network=apps"
-      - "traefik.http.routers.millyext.rule=Host(`leads.millyweb.com`)"
-      - "traefik.http.routers.millyext.entrypoints=https"
-      - "traefik.http.routers.millyext.tls.certresolver=letsencrypt"
-      - "traefik.http.services.millyext.loadbalancer.server.port=8099"
-
-  # ============================================================
-  # MCP LAYER (T3) — mcp network only
-  # ============================================================
-
+    - traefik.enable=true
+    - traefik.docker.network=apps
+    - traefik.http.routers.transcript-bridge.rule=Host(`bridge.millyweb.com`)
+    - traefik.http.routers.transcript-bridge.entrypoints=https
+    - traefik.http.routers.transcript-bridge.tls.certresolver=letsencrypt
+    - traefik.http.services.transcript-bridge.loadbalancer.server.port=8099
   helix-mcp:
     build: ./mcp
     container_name: helix-mcp
     restart: unless-stopped
     environment:
-      - HELIX_URL=http://helix-cortex:9050
+    - HELIX_URL=http://helix-cortex:9050
     networks:
-      - mcp
+    - mcp
     depends_on:
       helix-cortex:
         condition: service_healthy
-
 volumes:
-  transcript-bridge-data:
-  forge-data:
-  forge-workspace:
-  garage-data:
-  garage-meta:
-  millyext-data:
-
+  transcript-bridge-data: null
+  forge-data: null
+  forge-workspace: null
+  garage-data: null
+  garage-meta: null
 networks:
   apps:
     external: true
