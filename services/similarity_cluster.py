@@ -41,18 +41,20 @@ async def build_similarity_clusters(limit: int = 500) -> int:
         try:
             with db.get_connection() as conn:
                 # CTE forces IVFFlat index for ANN lookup (~0.23s per atom)
-                rows = conn.execute("""
+                cur = conn.execute("""
                     WITH target AS (
                         SELECT embedding FROM embeddings
                         WHERE source_id = %s AND source_type = 'atoms'
                     )
                     SELECT e.source_id, a.name, 1 - (e.embedding <=> t.embedding) as sim
-                    FROM embeddings e, target t
+                    FROM embeddings e
+                    CROSS JOIN target t
                     JOIN atoms a ON a.id = e.source_id
                     WHERE e.source_type = 'atoms' AND e.source_id != %s
                     ORDER BY e.embedding <=> t.embedding
                     LIMIT %s
-                """, (atom_id, atom_id, NEIGHBOR_COUNT + 10)).fetchall()
+                """, (atom_id, atom_id, NEIGHBOR_COUNT + 10))
+                rows = cur.fetchall()
 
             # Filter by threshold after ANN retrieval
             neighbors = [(nid, nname, float(sim)) for nid, nname, sim in rows if float(sim) >= SIMILARITY_THRESHOLD]
