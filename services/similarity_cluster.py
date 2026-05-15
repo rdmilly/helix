@@ -39,7 +39,6 @@ async def build_similarity_clusters(limit: int = 500) -> int:
     for atom_id, atom_name in unclustered:
         try:
             with db.get_connection() as conn:
-                conn.execute('SET enable_seqscan = off')
                 # CTE forces IVFFlat index for ANN lookup (~0.23s per atom)
                 rows = conn.execute("""
                     WITH target AS (
