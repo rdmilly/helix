@@ -84,8 +84,9 @@ async def handle_turn_flush(payload: Dict[str, Any]) -> Dict[str, Any]:
         _process_text(messages, session_id, payload),
         _parse_actions(payload, session_id),
         _extract_kg(messages, session_id),
+        _store_raw_turns(messages, session_id, turn_index),
     ]
-    labels = ["code_scanner", "text_processor", "action_parser", "kg_extractor"]
+    labels = ["code_scanner", "text_processor", "action_parser", "kg_extractor", "raw_store"]
 
     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
