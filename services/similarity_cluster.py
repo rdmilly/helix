@@ -1,42 +1,84 @@
-"""Similarity Cluster - writes similarity_cluster meta namespace."""
+"""Similarity Cluster - writes similarity_cluster meta namespace.
+
+Uses pgvector cosine similarity (<->) to find nearest neighbors.
+All embeddings live in the `embeddings` table (source_type='atoms').
+"""
 import logging
 from services.database import get_db
 from services.meta import get_meta_service
 from datetime import datetime
+
 log = logging.getLogger(__name__)
 NEIGHBOR_COUNT = 5
 SIMILARITY_THRESHOLD = 0.3
-async def build_similarity_clusters(limit=500):
-    from config import CHROMADB_HOST, CHROMADB_PORT
-    import httpx
-    db = get_db(); meta = get_meta_service()
+
+async def build_similarity_clusters(limit: int = 500) -> int:
+    db = get_db()
+    meta = get_meta_service()
+
     with db.get_connection() as conn:
-        atoms = conn.execute("SELECT a.id, a.name FROM atoms a WHERE NOT EXISTS (SELECT 1 FROM meta_events m WHERE m.target_id = a.id AND m.namespace = 'similarity_cluster') LIMIT %s", (limit,)).fetchall()
-    chromadb_url = f'http://{CHROMADB_HOST}:{CHROMADB_PORT}'
+        # Get atoms that haven't been clustered yet
+        unclustered = conn.execute("""
+            SELECT a.id, a.name
+            FROM atoms a
+            WHERE NOT EXISTS (
+                SELECT 1 FROM meta_events m
+                WHERE m.target_id = a.id AND m.namespace = 'similarity_cluster'
+            )
+            AND EXISTS (
+                SELECT 1 FROM embeddings e
+                WHERE e.source_id = a.id AND e.source_type = 'atoms' AND e.embedding IS NOT NULL
+            )
+            LIMIT %s
+        """, (limit,)).fetchall()
+
+    if not unclustered:
+        log.info('similarity_cluster: no unclustered atoms with embeddings')
+        return 0
+
+    log.info(f'similarity_cluster: clustering {len(unclustered)} atoms via pgvector')
     written = 0
-    async with httpx.AsyncClient(timeout=10) as client:
+
+    for atom_id, atom_name in unclustered:
         try:
-            col_resp = await client.get(f'{chromadb_url}/api/v1/collections')
-            cols = col_resp.json()
-            atom_col = next((c for c in cols if 'atom' in c.get('name', '').lower()), None)
-            if not atom_col:
-                log.warning('No atoms ChromaDB collection found. Run embedding pass first.')
-                return 0
-            col_id = atom_col['id']
+            with db.get_connection() as conn:
+                # Find N nearest neighbors using pgvector cosine distance
+                neighbors = conn.execute("""
+                    SELECT
+                        e2.source_id as neighbor_id,
+                        a2.name as neighbor_name,
+                        1 - (e1.embedding <=> e2.embedding) as similarity
+                    FROM embeddings e1
+                    JOIN embeddings e2
+                        ON e2.source_type = 'atoms'
+                        AND e2.source_id != e1.source_id
+                        AND e2.embedding IS NOT NULL
+                    JOIN atoms a2 ON a2.id = e2.source_id
+                    WHERE e1.source_id = %s
+                      AND e1.source_type = 'atoms'
+                      AND 1 - (e1.embedding <=> e2.embedding) >= %s
+                    ORDER BY e1.embedding <=> e2.embedding
+                    LIMIT %s
+                """, (atom_id, SIMILARITY_THRESHOLD, NEIGHBOR_COUNT)).fetchall()
+
+            if neighbors:
+                meta.write_meta(
+                    'atoms', atom_id, 'similarity_cluster',
+                    {
+                        'cluster_id': f'cluster_{atom_id[:8]}',
+                        'cluster_size': len(neighbors) + 1,
+                        'nearest_neighbors': [
+                            {'atom_id': nid, 'name': nname, 'similarity': round(float(sim), 3)}
+                            for nid, nname, sim in neighbors
+                        ],
+                        'clustered_at': datetime.utcnow().isoformat(),
+                        'method': 'pgvector_cosine'
+                    },
+                    written_by='chromadb_v1'
+                )
+                written += 1
         except Exception as e:
-            log.warning(f'ChromaDB not reachable: {e}')
-            return 0
-        for atom_id, name in atoms:
-            try:
-                resp = await client.post(f'{chromadb_url}/api/v1/collections/{col_id}/query', json={'query_texts': [name], 'n_results': NEIGHBOR_COUNT + 1, 'include': ['distances']})
-                result = resp.json()
-                ids = result.get('ids', [[]])[0]
-                distances = result.get('distances', [[]])[0]
-                neighbors = [{'atom_id': nid, 'similarity': round(1 - dist, 3)} for nid, dist in zip(ids, distances) if nid != atom_id and (1 - dist) >= SIMILARITY_THRESHOLD]
-                if neighbors:
-                    meta.write_meta('atoms', atom_id, 'similarity_cluster', {'cluster_id': f'cluster_{atom_id[:8]}', 'cluster_size': len(neighbors) + 1, 'nearest_neighbors': neighbors[:5], 'clustered_at': datetime.utcnow().isoformat()}, written_by='chromadb_v1')
-                    written += 1
-            except Exception as e:
-                log.debug(f'Similarity cluster skipped {atom_id}: {e}')
-    log.info(f'Similarity cluster: {written} atoms clustered')
+            log.debug(f'similarity_cluster skipped {atom_id}: {e}')
+
+    log.info(f'similarity_cluster: {written}/{len(unclustered)} atoms clustered')
     return written
