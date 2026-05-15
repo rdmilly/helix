@@ -1,0 +1,43 @@
+# Don't copy these into the image
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+*.egg-info
+dist
+build
+
+# Data dirs (mounted at runtime via -v)
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets
+secrets/
+*.env
+*.key
+*.pem
+
+# Model files (large, mounted at runtime - NOT the models/ Python package)
+*.onnx
+*.safetensors
+embeddings-cache/
+
+# Logs
+logs/
+*.log
+
+# Postgres data
+postgres-data/
+
+# App directory (only in app/ not services/)
+app/
+
+# Node
+node_modules/
+.npm

@@ -26,6 +26,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from services.scanner import get_scanner_service
+from services.meta import get_meta_service
 from services.database import get_db
 from services.chromadb import get_chromadb_service
 # embeddings handled internally by chromadb.add_document
@@ -182,6 +183,18 @@ async def _embed_atoms(atoms: List[Dict[str, Any]]):
             )
             if success:
                 embedded += 1
+                # Mark embedded_at in postgres
+                try:
+                    from services.database import get_db as _gdb
+                    from datetime import datetime as _dt
+                    with _gdb().get_connection() as _conn:
+                        _conn.execute(
+                            "UPDATE atoms SET embedded_at = %s WHERE id = %s",
+                            (_dt.utcnow().isoformat(), atom["id"])
+                        )
+                        _conn.commit()
+                except Exception:
+                    pass
         except Exception as e:
             logger.error(f"Failed to embed atom {atom.get('id')}: {e}")
     
@@ -292,7 +305,24 @@ async def scan_repo(req: ScanRepoRequest):
             total_updated += len(updated)
             total_embedded += embedded
             all_atoms.extend(atoms)
-            
+
+            # Write co_occurrence for atoms in the same file
+            if len(atoms) >= 2:
+                atom_ids = [a["id"] for a in atoms if a.get("id")]
+                _meta = get_meta_service()
+                for aid in atom_ids:
+                    co_ids = [x for x in atom_ids if x != aid][:10]
+                    if co_ids:
+                        try:
+                            _meta.write_meta("atoms", aid, "co_occurrence", {
+                                "always_with": co_ids,
+                                "file": str(filepath),
+                                "confidence": round(1.0 / len(atom_ids), 3),
+                                "observations": 1,
+                            }, written_by="predictor_v1")
+                        except Exception:
+                            pass
+
             file_results.append({
                 "file": filepath,
                 "created": len(created),

@@ -1,117 +1,102 @@
-"""Embedding Service - BGE-M3 via FastEmbed (ONNX)
+"""Embedding Service — routes to helix-embeddings sidecar via HTTP.
 
-Computes dense embeddings for ChromaDB storage and search.
-Model downloads to persistent volume on first run, cached after.
+Consolidated architecture: all embeddings go through one service.
+helix-embeddings runs BAAI/bge-large-en-v1.5 (1024 dims) via ONNX.
 
-BGE-M3 chosen for code semantic understanding -- critical for
-distinguishing similar code patterns in the DNA library.
+Previous: helix-cortex loaded its own ONNX model (1.3GB in memory).
+Now: HTTP call to helix-embeddings sidecar (already running, shared).
+
+Benefits:
+  - helix-cortex uses ~1.3GB less memory
+  - No startup delay loading ONNX
+  - One consistent embedding service: ChromaDB + pgvector + scanner all identical
+  - ONNX runtime on sidecar is already optimized and warm
 """
 import logging
+import os
 from typing import List, Optional
-from pathlib import Path
-
-from fastembed import TextEmbedding
-
-from config import CURRENT_EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, DATA_DIR
 
 logger = logging.getLogger(__name__)
 
-# Cache model in persistent volume so it survives rebuilds
-MODEL_CACHE_DIR = str(DATA_DIR / "models")
-
-# Map our config names to fastembed model identifiers
-MODEL_MAP = {
-    "bge-m3": "BAAI/bge-m3",
-    "bge-large-en-v1.5": "BAAI/bge-large-en-v1.5",
-    "bge-base-en-v1.5": "BAAI/bge-base-en-v1.5",
-    "bge-small-en-v1.5": "BAAI/bge-small-en-v1.5",
-    "all-MiniLM-L6-v2": "sentence-transformers/all-MiniLM-L6-v2",
-}
+EMBEDDINGS_URL = os.getenv("EMBEDDINGS_URL", "http://helix-embeddings:8000")
 
 
 class EmbeddingService:
-    """Compute text embeddings using FastEmbed (ONNX runtime).
-    
-    Thread-safe singleton. Model loads lazily on first embed call.
-    Downloads ~600MB on first run (cached in persistent volume).
+    """Proxy to helix-embeddings sidecar. Same interface as the old fastembed class.
+    All embedding calls go to the sidecar via HTTP — one model, one service.
     """
-    
+
     def __init__(self):
-        self._model: Optional[TextEmbedding] = None
-        self._model_name = MODEL_MAP.get(CURRENT_EMBEDDING_MODEL, CURRENT_EMBEDDING_MODEL)
         self._ready = False
-    
-    def initialize(self) -> bool:
-        """Load the embedding model. Call during app startup."""
-        if self._ready:
-            return True
-        
+        self._model_name = "BAAI/bge-large-en-v1.5"
+        self._url = EMBEDDINGS_URL
+
+    async def initialize(self) -> bool:
+        """Verify helix-embeddings sidecar is reachable."""
+        import httpx
         try:
-            Path(MODEL_CACHE_DIR).mkdir(parents=True, exist_ok=True)
-            
-            logger.info(f"Loading embedding model: {self._model_name} (cache: {MODEL_CACHE_DIR})")
-            self._model = TextEmbedding(
-                model_name=self._model_name,
-                cache_dir=MODEL_CACHE_DIR,
-            )
-            
-            # Warm up with a test embed
-            test = list(self._model.embed(["test"]))
-            actual_dim = len(test[0])
-            logger.info(f"Embedding model ready: {self._model_name} (dim={actual_dim})")
-            
-            if actual_dim != EMBEDDING_DIMENSIONS:
-                logger.warning(
-                    f"Dimension mismatch: config says {EMBEDDING_DIMENSIONS}, "
-                    f"model produces {actual_dim}. Using actual: {actual_dim}"
-                )
-            
-            self._ready = True
-            return True
-            
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(f"{self._url}/health")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    self._model_name = data.get("model", self._model_name)
+                    self._ready = True
+                    logger.info(f"EmbeddingService ready: {self._model_name} via {self._url}")
+                    return True
         except Exception as e:
-            logger.error(f"Failed to load embedding model: {e}")
-            self._ready = False
-            return False
-    
+            logger.warning(f"EmbeddingService: helix-embeddings unreachable: {e}")
+        self._ready = False
+        return False
+
     def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        """Compute embeddings for a list of texts.
-        
-        Returns list of float vectors. Empty list on failure.
-        """
-        if not self._ready or not self._model:
-            logger.warning("Embedding model not ready, returning empty")
-            return []
-        
+        """Compute embeddings via sidecar. Synchronous wrapper."""
         if not texts:
             return []
-        
+        import httpx
         try:
-            # fastembed returns a generator of numpy arrays
-            embeddings = list(self._model.embed(texts))
-            return [emb.tolist() for emb in embeddings]
+            resp = httpx.post(
+                f"{self._url}/embed",
+                json={"texts": texts},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                return resp.json().get("embeddings", [])
         except Exception as e:
-            logger.error(f"Embedding computation failed: {e}")
+            logger.error(f"embed_texts failed: {e}")
+        return []
+
+    async def embed_texts_async(self, texts: List[str]) -> List[List[float]]:
+        """Async version for use in async contexts."""
+        if not texts:
             return []
-    
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{self._url}/embed",
+                    json={"texts": texts},
+                )
+                if resp.status_code == 200:
+                    return resp.json().get("embeddings", [])
+        except Exception as e:
+            logger.error(f"embed_texts_async failed: {e}")
+        return []
+
     def embed_single(self, text: str) -> Optional[List[float]]:
-        """Compute embedding for a single text. Returns None on failure."""
         results = self.embed_texts([text])
         return results[0] if results else None
-    
+
     @property
     def is_ready(self) -> bool:
         return self._ready
-    
+
     @property
     def model_name(self) -> str:
-        return CURRENT_EMBEDDING_MODEL
+        return self._model_name
 
 
-# Global singleton
 _embedding_service = EmbeddingService()
 
 
 def get_embedding_service() -> EmbeddingService:
-    """Get embedding service instance."""
     return _embedding_service

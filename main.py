@@ -25,8 +25,11 @@ from routers.cockpit import router as cockpit_router
 from routers.recovery import router as recovery_router
 from routers.shard import router as shard_router
 from routers.turn_flush import router as turn_flush_router
+from routers.journal import router as journal_router
 from routers.inject import router as inject_router
 from routers.scan import router as scan_router
+from routers.enrich import router as enrich_router
+from routers.agent_events import router as agent_events_router
 from routers.runbook import router as runbook_router
 from routers.conversations import router as conversations_router
 from routers.observer import router as observer_router
@@ -110,6 +113,24 @@ async def lifespan(app: FastAPI):
         log.info(f"VectorStore ready (pgvector + BGE-large)")
     except Exception as e:
         log.warning(f"VectorStore unavailable (circuit breaker open) -- vector search degraded: {e}")
+
+    # EmbeddingService — now routes to helix-embeddings HTTP sidecar
+    try:
+        from services.embeddings import get_embedding_service
+        embed_svc = get_embedding_service()
+        await embed_svc.initialize()  # just verifies sidecar is reachable
+        log.info(f"EmbeddingService ready: {embed_svc.model_name} via sidecar")
+    except Exception as e:
+        log.warning(f"EmbeddingService unavailable: {e}")
+
+    # ChromaDB — vector store for atom + conversation embeddings
+    try:
+        from services.chromadb import get_chromadb_service
+        chroma = get_chromadb_service()
+        await chroma.initialize()
+        log.info(f"ChromaDB ready: collections initialized")
+    except Exception as e:
+        log.warning(f"ChromaDB unavailable (embedding pass will be skipped): {e}")
 
     # Neo4j
     try:
@@ -383,6 +404,9 @@ from routers.auth_email import auth_email_router
 app.include_router(login_router)
 app.include_router(auth_google_router, tags=["Auth - Google OAuth"])
 app.include_router(auth_email_router, tags=["Auth - Email/Password"])
+app.include_router(journal_router)
+app.include_router(enrich_router, tags=["Enrichment"])
+app.include_router(agent_events_router, tags=["Agent Events"])
 
 # MCP mount removed — see helix-mcp service (port 9096)
 
