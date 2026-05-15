@@ -1,8 +1,17 @@
+# Helix — Unified Stack
+# All services that form the Helix intelligence platform.
+# Networks follow the canonical 4-network pattern (Paving Agent v0.3 PRD A4):
+#   apps  = application containers that talk to each other (T2)
+#   data  = databases and stateful stores only (T4)
+#   mcp   = MCP servers + gateway layer (T3)
+#   edge  = Traefik <-> public-facing services (T1)
+
 services:
 
-  # --- Infisical Agent ---
-  # Fetches external API keys from Infisical, writes to ./secrets/helix.env
-  # Polls every 5 minutes. helix-cortex waits for healthy before starting.
+  # ============================================================
+  # SECRETS & CONFIG
+  # ============================================================
+
   helix-infisical-agent:
     image: infisical/cli:latest
     container_name: helix-infisical-agent
@@ -12,7 +21,7 @@ services:
       - ./infisical-entrypoint.sh:/config/infisical-entrypoint.sh:ro
       - ./secrets:/secrets
     networks:
-      - helix
+      - apps
     healthcheck:
       test: ["CMD", "sh", "-c", "test -s /secrets/helix.env && grep -q ANTHROPIC_API_KEY /secrets/helix.env"]
       interval: 10s
@@ -24,73 +33,9 @@ services:
         limits:
           memory: 128M
 
-  # --- Helix Cortex ---
-  helix-cortex:
-    build: .
-    container_name: helix-cortex
-    restart: unless-stopped
-    ports:
-      - "9050:9050"
-    volumes:
-      - ./data:/app/data
-      - ./services:/app/services
-      - ./routers:/app/routers
-      - ./models:/app/models
-      - ./main.py:/app/main.py
-      - ./config.py:/app/config.py
-      - ./mcp_tools.py:/app/mcp_tools.py
-      - ./mcp_tools_action.py:/app/mcp_tools_action.py
-      - ./secrets:/secrets:ro
-      - /opt/projects:/opt/projects
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /opt/data/working-kb:/app/working-kb:rw
-    env_file:
-      - .env
-      - ./secrets/helix.env
-    networks:
-      - coolify
-      - helix
-      - shared
-      - mcp-network
-    depends_on:
-      helix-infisical-agent:
-        condition: service_healthy
-      helix-postgres:
-        condition: service_healthy
-      helix-embeddings:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9050/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
-    labels:
-      - "traefik.enable=true"
-      - "traefik.docker.network=coolify"
-      - "traefik.http.routers.helix.rule=Host(`helix.millyweb.com`)"
-      - "traefik.http.routers.helix.entrypoints=https"
-      - "traefik.http.routers.helix.tls.certresolver=letsencrypt"
-      - "traefik.http.services.helix.loadbalancer.server.port=9050"
-
-  helix-chromadb:
-    image: chromadb/chroma:0.5.23
-    container_name: helix-chromadb
-    restart: unless-stopped
-    volumes:
-      - ./chromadb-data:/chroma/chroma
-    environment:
-      - ANONYMIZED_TELEMETRY=False
-    networks:
-      - helix
-    healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8000"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
-
-  # --- Phase 1 sidecars ---
+  # ============================================================
+  # DATA PLANE (T4) — data network only
+  # ============================================================
 
   helix-postgres:
     image: pgvector/pgvector:pg16
@@ -101,11 +46,11 @@ services:
       POSTGRES_USER: helix
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
-      - ./postgres-data:/var/lib/postgresql/data
+      - /opt/data/helix/postgres-data:/var/lib/postgresql/data
     ports:
       - "9037:5432"
     networks:
-      - helix
+      - data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U helix"]
       interval: 10s
@@ -126,7 +71,7 @@ services:
       - "9038:7474"
       - "9039:7687"
     networks:
-      - helix
+      - data
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
       interval: 20s
@@ -140,12 +85,56 @@ services:
     restart: unless-stopped
     command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
     networks:
-      - helix
+      - data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 3s
       retries: 3
+
+  helix-chromadb:
+    image: chromadb/chroma:0.5.23
+    container_name: helix-chromadb
+    restart: unless-stopped
+    volumes:
+      - ./chromadb-data:/chroma/chroma
+    environment:
+      - ANONYMIZED_TELEMETRY=False
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/8000"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  helix-garage:
+    image: dxflrs/garage:v1.0.1
+    container_name: helix-garage
+    restart: unless-stopped
+    environment:
+      - GARAGE_RPC_SECRET=${GARAGE_RPC_SECRET}
+    volumes:
+      - /opt/projects/the-forge/garage.toml:/etc/garage.toml:ro
+      - garage-data:/var/lib/garage/data
+      - garage-meta:/var/lib/garage/meta
+    networks:
+      - apps
+    healthcheck:
+      test: ["CMD", "/garage", "-c", "/etc/garage.toml", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # ============================================================
+  # APPLICATION LAYER (T2) — apps + data networks
+  # ============================================================
 
   helix-embeddings:
     build: ./services/embeddings
@@ -157,7 +146,8 @@ services:
     volumes:
       - /opt/data/helix/data/models:/models:ro
     networks:
-      - helix
+      - apps
+      - data
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
@@ -165,9 +155,84 @@ services:
       retries: 3
       start_period: 30s
 
-  # --- Transcript Bridge ---
-  # Receives Claude conversation transcripts from MemBrain extension.
-  # Stores raw JSON backup, forwards to helix-cortex for ingestion.
+  helix-cortex:
+    build: .
+    container_name: helix-cortex
+    restart: unless-stopped
+    ports:
+      - "9050:9050"
+    volumes:
+      - /opt/data/helix:/app/data
+      - /opt/projects:/opt/projects:ro
+    env_file:
+      - ./secrets/helix.env
+    networks:
+      - apps
+      - data
+      - mcp
+    depends_on:
+      helix-infisical-agent:
+        condition: service_healthy
+      helix-postgres:
+        condition: service_healthy
+      helix-embeddings:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9050/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=apps"
+      - "traefik.http.routers.helix.rule=Host(`helix.millyweb.com`)"
+      - "traefik.http.routers.helix.entrypoints=https"
+      - "traefik.http.routers.helix.tls.certresolver=letsencrypt"
+      - "traefik.http.services.helix.loadbalancer.server.port=9050"
+
+  the-forge:
+    build: /opt/projects/the-forge
+    container_name: the-forge
+    restart: unless-stopped
+    ports:
+      - "9095:9095"
+    environment:
+      - PORT=9095
+      - DATA_DIR=/app/data
+      - WORKSPACE_ROOT=/workspace
+      - STORAGE_ENDPOINT=helix-garage:3900
+      - STORAGE_ACCESS_KEY=${GARAGE_ACCESS_KEY}
+      - STORAGE_SECRET_KEY=${GARAGE_SECRET_KEY}
+      - STORAGE_BUCKET=workspace
+      - STORAGE_SECURE=false
+      - HELIX_URL=http://helix-cortex:9050
+    volumes:
+      - forge-data:/app/data
+      - forge-workspace:/workspace
+      - /opt/projects:/projects:rw
+    networks:
+      - apps
+      - mcp
+    depends_on:
+      helix-garage:
+        condition: service_healthy
+      helix-cortex:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9095/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=apps"
+      - "traefik.http.routers.forge.rule=Host(`forge.millyweb.com`)"
+      - "traefik.http.routers.forge.entrypoints=https"
+      - "traefik.http.routers.forge.tls.certresolver=letsencrypt"
+      - "traefik.http.services.forge.loadbalancer.server.port=9095"
+
   transcript-bridge:
     build: ./transcript-bridge
     container_name: transcript-bridge
@@ -180,34 +245,86 @@ services:
     volumes:
       - transcript-bridge-data:/app/data
     networks:
-      - helix
-      - coolify
+      - apps
+      - edge
     depends_on:
       helix-cortex:
         condition: service_healthy
-    labels:
-      - "traefik.enable=true"
-      - "traefik.docker.network=coolify"
-      - "traefik.http.routers.transcript-bridge.rule=Host(`bridge.millyweb.com`)"
-      - "traefik.http.routers.transcript-bridge.entrypoints=https"
-      - "traefik.http.routers.transcript-bridge.tls.certresolver=letsencrypt"
-      - "traefik.http.services.transcript-bridge.loadbalancer.server.port=8099"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8099/')"] 
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8099/')"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 15s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=apps"
+      - "traefik.http.routers.transcript-bridge.rule=Host(`bridge.millyweb.com`)"
+      - "traefik.http.routers.transcript-bridge.entrypoints=https"
+      - "traefik.http.routers.transcript-bridge.tls.certresolver=letsencrypt"
+      - "traefik.http.services.transcript-bridge.loadbalancer.server.port=8099"
+
+  millyext-receiver:
+    build: /opt/projects/millyext-receiver
+    container_name: millyext-receiver
+    restart: unless-stopped
+    ports:
+      - "8099:8099"
+    volumes:
+      - millyext-data:/data
+    environment:
+      - MILLYEXT_API_KEY=${MILLYEXT_API_KEY:-milly-dev-key}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - GOOGLE_PLACES_KEY=${GOOGLE_PLACES_KEY}
+      - DB_HOST=helix-postgres
+      - DB_PORT=5432
+      - DB_NAME=leads
+      - DB_USER=helix
+      - DB_PASS=${POSTGRES_PASSWORD}
+    networks:
+      - apps
+      - data
+    depends_on:
+      helix-postgres:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=apps"
+      - "traefik.http.routers.millyext.rule=Host(`leads.millyweb.com`)"
+      - "traefik.http.routers.millyext.entrypoints=https"
+      - "traefik.http.routers.millyext.tls.certresolver=letsencrypt"
+      - "traefik.http.services.millyext.loadbalancer.server.port=8099"
+
+  # ============================================================
+  # MCP LAYER (T3) — mcp network only
+  # ============================================================
+
+  helix-mcp:
+    build: ./mcp
+    container_name: helix-mcp
+    restart: unless-stopped
+    environment:
+      - HELIX_URL=http://helix-cortex:9050
+    networks:
+      - mcp
+    depends_on:
+      helix-cortex:
+        condition: service_healthy
 
 volumes:
   transcript-bridge-data:
+  forge-data:
+  forge-workspace:
+  garage-data:
+  garage-meta:
+  millyext-data:
 
 networks:
-  coolify:
+  apps:
     external: true
-  helix:
-    name: helix
-  shared:
+  data:
     external: true
-  mcp-network:
+  mcp:
+    external: true
+  edge:
     external: true
