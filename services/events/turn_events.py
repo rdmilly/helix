@@ -232,3 +232,85 @@ async def _extract_kg(messages: List[Dict], session_id: str) -> Dict[str, Any]:
     except Exception as e:
         log.debug(f"KG extraction failed: {e}")
         return {"status": "error", "error": str(e)}
+
+
+async def _store_raw_turns(
+    messages: List[Dict], session_id: str, turn_index: int
+) -> Dict[str, Any]:
+    """Store raw turn text verbatim in conversation_turns table and embed it.
+
+    Unlike _process_text which embeds a Haiku summary, this stores and embeds
+    the full verbatim text so retrieval gets exact quotes, not compressed summaries.
+    ChromaDB doc_id uses session+turn+sender to allow upsert dedup.
+    """
+    try:
+        from services import pg_sync
+        from services.chromadb import get_chromadb_service
+        import uuid
+
+        chromadb = get_chromadb_service()
+        stored = 0
+        embedded = 0
+
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+
+            # Flatten structured content to text
+            if isinstance(content, list):
+                content = " ".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            if not content or not content.strip():
+                continue
+
+            doc_id = f"{session_id}_t{turn_index}_{role}"
+            entry_id = str(uuid.uuid5(uuid.NAMESPACE_URL, doc_id))
+            token_est = len(content) // 4  # rough estimate
+
+            with pg_sync.get_pg_conn() as conn:
+                conn.execute("""
+                    INSERT INTO conversation_turns
+                      (id, session_id, turn_index, sender, text, token_count, ts)
+                    VALUES (%s, %s, %s, %s, %s, %s, now())
+                    ON CONFLICT (session_id, turn_index, sender) DO UPDATE
+                      SET text = EXCLUDED.text,
+                          token_count = EXCLUDED.token_count,
+                          ts = now()
+                """, (entry_id, session_id, turn_index, role, content, token_est))
+                conn.commit()
+            stored += 1
+
+            # Embed verbatim into ChromaDB alongside the summary embedding
+            # Prefix with role so retrieval knows who said what
+            embed_text = f"[{role.upper()}] {content}"
+            try:
+                await chromadb.add_document(
+                    collection_base="turns",
+                    doc_id=doc_id,
+                    text=embed_text,
+                    metadata={
+                        "session_id": session_id,
+                        "turn_index": turn_index,
+                        "sender": role,
+                        "token_count": token_est,
+                    },
+                )
+                # Mark as embedded
+                with pg_sync.get_pg_conn() as conn:
+                    conn.execute(
+                        "UPDATE conversation_turns SET embedded_at = now() WHERE id = %s",
+                        (entry_id,)
+                    )
+                    conn.commit()
+                embedded += 1
+            except Exception as embed_err:
+                log.debug(f"Embedding failed for {doc_id}: {embed_err}")
+
+        log.info(f"turn.flush raw_store: {stored} stored, {embedded} embedded session={session_id} turn={turn_index}")
+        return {"status": "ok", "stored": stored, "embedded": embedded}
+
+    except Exception as e:
+        log.debug(f"Raw turn storage failed: {e}")
+        return {"status": "error", "error": str(e)}
