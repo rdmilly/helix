@@ -50,54 +50,19 @@ async def enrich_compression(limit: int = 100):
 
 @router.post("/similarity")
 async def enrich_similarity(limit: int = 500):
-    """Build similarity clusters via ChromaDB.
+    """Build similarity clusters using pgvector IVFFlat ANN.
     
-    Auto-triggers embedding pass first if un-embedded atoms exist.
-    Uses embedded_at column to track state — never re-embeds unnecessarily.
+    Queries pgvector embeddings table directly (not ChromaDB).
+    All atom embeddings live in postgres.embeddings (source_type=atoms).
+    ~0.23s per atom with IVFFlat index. Run in batches of 500.
     """
-    from services.database import get_db
     from services.similarity_cluster import build_similarity_clusters
-    
-    # Auto-embed any atoms not yet in ChromaDB
-    db = get_db()
-    with db.get_connection() as conn:
-        unembedded = conn.execute(
-            "SELECT COUNT(*) FROM atoms WHERE embedded_at IS NULL"
-        ).fetchone()[0]
-    
-    auto_embedded = 0
-    if unembedded > 0:
-        from services.chromadb import get_chromadb_service
-        chroma = get_chromadb_service()
-        if not chroma._initialized:
-            await chroma.initialize()
-        from datetime import datetime
-        with db.get_connection() as conn:
-            atoms = conn.execute(
-                "SELECT id, name, code FROM atoms WHERE embedded_at IS NULL ORDER BY occurrence_count DESC LIMIT %s",
-                (min(unembedded, 2000),)
-            ).fetchall()
-        now = datetime.utcnow().isoformat()
-        for atom_id, name, code in atoms:
-            text = f"{name} {(code or '')[:300]}"
-            try:
-                success = await chroma.add_document(
-                    collection_base="atoms", doc_id=atom_id,
-                    text=text, metadata={"name": name}
-                )
-                if success:
-                    with db.get_connection() as conn:
-                        conn.execute("UPDATE atoms SET embedded_at = %s WHERE id = %s", (now, atom_id))
-                        conn.commit()
-                    auto_embedded += 1
-            except Exception:
-                pass
-    
     count = await build_similarity_clusters(limit=limit)
     return {
         "status": "ok",
-        "auto_embedded_first": auto_embedded,
         "atoms_clustered": count,
+        "limit": limit,
+        "backend": "pgvector_ivfflat"
     }
 
 
