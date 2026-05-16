@@ -195,7 +195,7 @@ class MitochondriaWorker:
                 "attempts":     row["attempts"],
             }
             cursor.execute("""
-                UPDATE queue SET status = 'processing', started_at = NOW(),
+                UPDATE queue SET status = 'processing', started_at = CURRENT_TIMESTAMP,
                     attempts = attempts + 1
                 WHERE id = ?
             """, (queue_id,))
@@ -228,7 +228,7 @@ class MitochondriaWorker:
             # Mark items as processing
             for item in items:
                 cursor.execute("""
-                    UPDATE queue SET status = 'processing', started_at = NOW(),
+                    UPDATE queue SET status = 'processing', started_at = CURRENT_TIMESTAMP,
                         attempts = attempts + 1
                     WHERE id = ?
                 """, (item["id"],))
@@ -563,7 +563,7 @@ class MitochondriaWorker:
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                UPDATE queue SET status = 'completed', completed_at = NOW(),
+                UPDATE queue SET status = 'completed', completed_at = CURRENT_TIMESTAMP,
                     meta = ?
                 WHERE id = ?
             """, (json.dumps({"result": {k: v for k, v in result.items() if k != "atoms"}}), queue_id))
@@ -580,7 +580,7 @@ class MitochondriaWorker:
             cursor = conn.cursor()
             cursor.execute("""
                 UPDATE queue SET status = 'failed', error = ?,
-                    completed_at = NOW()
+                    completed_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             """, (error[:1000], queue_id))
             conn.commit()
