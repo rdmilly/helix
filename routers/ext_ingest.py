@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from collections import defaultdict
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, BackgroundTasks, Header
 from pydantic import BaseModel, Field
 
 from services import conversation_store
@@ -102,6 +102,49 @@ def _turns_to_transcript(turns: List[TurnPayload]) -> str:
         prefix = ROLE_PREFIX.get(t.role.lower(), t.role.capitalize())
         lines.append(f"{prefix}: {t.content.strip()}")
     return "\n\n".join(lines)
+
+
+async def _process_ingest(payload: ExtIngestPayload):
+    """Background processing for backfill payloads - same logic as ext_ingest."""
+    turns = payload.turns
+    if not turns:
+        return
+    grouped: Dict[str, List[TurnPayload]] = defaultdict(list)
+    for t in turns:
+        key = t.conversationId or f"ext-{t.platform}-unknown"
+        grouped[key].append(t)
+    for conv_id, conv_turns in grouped.items():
+        try:
+            conv_turns.sort(key=lambda t: float(t.timestamp) if isinstance(t.timestamp, (int, float)) else 0.0)
+            transcript = _turns_to_transcript(conv_turns)
+            if not transcript.strip():
+                continue
+            platform = conv_turns[0].platform if conv_turns else "unknown"
+            source = PLATFORM_SOURCE.get(platform, f"ext-{platform}")
+            timestamp = _parse_timestamp(conv_turns[0].timestamp)
+            from services.content_detector import detect
+            ctype, cconf = detect(transcript)
+            metadata = {
+                "extension_version": payload.extensionVersion,
+                "flushed_at": payload.flushedAt,
+                "platform": platform,
+                "turn_count": len(conv_turns),
+                "capture_types": list({t.captureType for t in conv_turns if t.captureType}),
+                "url": conv_turns[0].url if conv_turns else None,
+                "content_type": ctype,
+                "content_confidence": round(cconf, 2),
+                "backfill": True,
+            }
+            await conversation_store.ingest_conversation(
+                text=transcript,
+                session_id=conv_id,
+                source=source,
+                timestamp=timestamp,
+                metadata=metadata,
+            )
+            logger.info(f"[ext_ingest_bg] Ingested conv {conv_id} ({len(conv_turns)} turns)")
+        except Exception as e:
+            logger.error(f"[ext_ingest_bg] Failed {conv_id}: {e}")
 
 
 @router.post("/ingest", response_model=ExtIngestResponse)
