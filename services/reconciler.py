@@ -32,7 +32,7 @@ async def run_reconciler() -> dict:
     haiku = get_haiku_service()
 
     # Check circuit breaker
-    if hasattr(haiku, 'circuit_breaker') and haiku.circuit_breaker.failures > 5:
+    if hasattr(haiku, 'circuit_breaker') and haiku.circuit_breaker.failure_count > 5:
         log.warning("Reconciler: Haiku circuit breaker open, stopping")
         return {"processed": 0, "skipped": 1, "errors": 0}
 
