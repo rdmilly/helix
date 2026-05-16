@@ -107,11 +107,17 @@ def _turns_to_transcript(turns: List[TurnPayload]) -> str:
 @router.post("/ingest", response_model=ExtIngestResponse)
 async def ext_ingest(
     payload: ExtIngestPayload,
+    background_tasks: BackgroundTasks,
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
     turns = payload.turns
     if not turns:
         return ExtIngestResponse(turns_received=0, conversations=0)
+
+    # For backfill payloads: queue and return immediately to avoid timeouts
+    if getattr(payload, 'backfill', False):
+        background_tasks.add_task(_process_ingest, payload)
+        return ExtIngestResponse(turns_received=len(turns), conversations=len({t.conversationId for t in turns}), queued=True)
 
     grouped: Dict[str, List[TurnPayload]] = defaultdict(list)
     for t in turns:
