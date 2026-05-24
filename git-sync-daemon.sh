@@ -25,6 +25,7 @@ VPS1_REPOS=(
   "/opt/projects/git-agent|rdmilly/git-agent|main"
   "/opt/projects/paving-agent|rdmilly/paving-agent|main"
   "/opt/projects/content-pipeline|rdmilly/content-pipeline|main"
+  "/opt/projects/millyext-receiver|rdmilly/millyext-receiver|main"
   "/opt/stacks|rdmilly/millyweb-infra|main"
 )
 
