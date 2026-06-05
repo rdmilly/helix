@@ -131,49 +131,7 @@ services:
       resources:
         limits:
           memory: 128M
-  helix-embeddings:
-    build: ./services/embeddings
-    container_name: helix-embeddings
-    restart: unless-stopped
-    environment:
-      MODEL_PATH: /models/models--qdrant--bge-large-en-v1.5-onnx/snapshots/dc76b2c078fc38f0d243233d0ab0b51de925557e
-      OMP_NUM_THREADS: '2'
-    volumes:
-    - /opt/data/helix/data/models:/models:ro
-    networks:
-    - apps
-    - data
-    healthcheck:
-      test:
-      - CMD
-      - python3
-      - -c
-      - import urllib.request; urllib.request.urlopen('http://localhost:8000/health')
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-  helix-cortex:
-    build: .
-    container_name: helix-cortex
-    restart: unless-stopped
-    ports:
-    - 9050:9050
-    volumes:
-    - /opt/data/helix:/app/data
-    - /opt/projects:/opt/projects:ro
-    env_file:
-    - ./secrets/helix.env
-    networks:
-    - apps
-    - data
-    - mcp
-    depends_on:
-      helix-infisical-agent:
-        condition: service_healthy
       helix-postgres:
-        condition: service_healthy
-      helix-embeddings:
         condition: service_healthy
     healthcheck:
       test:
