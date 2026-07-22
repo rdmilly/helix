@@ -8,6 +8,12 @@ services:
     volumes:
       - /opt/data/helix:/app/data
       - /opt/projects:/opt/projects
+      # single-FILE mounts (2026-07-21): directory mounts drag in the host
+      # __pycache__ (stale .pyc from March) and break imports. File mounts
+      # deploy fixes without shadowing the image's compiled cache.
+      - ./routers/ext_ingest.py:/app/routers/ext_ingest.py:ro
+      - ./services/pg_sync.py:/app/services/pg_sync.py:ro
+      - ./services/reconciler.py:/app/services/reconciler.py:ro
     env_file:
       - .env
       - ./secrets/helix.env
