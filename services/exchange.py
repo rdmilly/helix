@@ -261,11 +261,18 @@ def _extract_intelligence(
     rels_rejected = []
     for rel in relationships:
         if isinstance(rel, dict) and rel.get("source") and rel.get("target"):
-            conn.execute(
-                "INSERT INTO kg_relationships (source_name, target_name, relation_type, description, session_id, created_at) VALUES (?,?,?,?,?,?)",
-                (rel["source"], rel["target"], rel.get("relation_type") or rel.get("type", "related_to"), rel.get("description", ""), session_id, timestamp)
-            )
-            rels_created += 1
+            try:
+                conn.execute(
+                    "INSERT INTO kg_relationships (source_name, target_name, relation_type, description, session_id, created_at) VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+                    (rel["source"], rel["target"], rel.get("relation_type") or rel.get("type", "related_to"), rel.get("description", ""), session_id, timestamp)
+                )
+                rels_created += 1
+            except Exception as _exc:
+                # An edge that already exists must never abort the whole exchange.
+                rels_rejected.append({
+                    "reason": "insert failed: %s" % str(_exc).strip()[:120],
+                    "input": {k: rel.get(k) for k in ("source", "target", "relation_type")},
+                })
         else:
             # Gate: never drop input silently (scar_helix_exchange_post_d07e).
             if isinstance(rel, dict):

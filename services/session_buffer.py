@@ -288,8 +288,14 @@ def flush(session_id: str, dry_run: bool = False) -> Dict[str, Any]:
         from services import exchange as exchange_service
         result = exchange_service.record_exchange(payload)
         report["exchange"] = result
-        _mark(routed_ids, "flushed", "routed via record_exchange")
-        report["flushed"] = len(routed_ids)
+        # A returned error is still an error — do not trust status alone.
+        if isinstance(result, dict) and result.get("status") == "error":
+            _mark(routed_ids, "buffered", "exchange returned error: %s" % str(result.get("error"))[:120])
+            report["flushed"] = 0
+            report["error"] = result.get("error")
+        else:
+            _mark(routed_ids, "flushed", "routed via record_exchange")
+            report["flushed"] = len(routed_ids)
     except Exception as exc:            # never lose the buffer on a routing failure
         log.exception("session_buffer flush failed for %s", session_id)
         _mark(routed_ids, "buffered", "flush failed: %s" % exc)
