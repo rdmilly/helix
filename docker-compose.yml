@@ -21,6 +21,10 @@ services:
       # embeddings moved to the controller card on VPS2; the old helix-embeddings
       # container no longer exists and .env still points at it (2026-07-21)
       EMBEDDINGS_URL: http://100.64.0.1:9060
+      # 0 = skip Haiku summaries/intelligence during the bulk backfill (~$141 saved
+      # on 2108 conversations). Raw storage, chunking and embeddings still run.
+      # Flip back to 1 after the Claude-authored summary pipeline lands.
+      HELIX_LLM_ENRICH: "0"
     networks:
       - apps
       - data
