@@ -109,10 +109,20 @@ class PgCursor:
         sql = _Q_RE.sub('%s', sql)
         # Strip SQLite-only clauses that are no-ops in PG
         sql = re.sub(r'\bIF NOT EXISTS\b', 'IF NOT EXISTS', sql)  # keep (PG supports it)
-        if params is None:
-            self._c.execute(sql)
-        else:
-            self._c.execute(sql, params)
+        try:
+            if params is None:
+                self._c.execute(sql)
+            else:
+                self._c.execute(sql, params)
+        except Exception:
+            # Roll back immediately so a single failed statement cannot leave the
+            # shared connection in an aborted state and cascade into
+            # InFailedSqlTransaction for every later write (2026-07-21).
+            try:
+                self._c.connection.rollback()
+            except Exception:
+                pass
+            raise
         self.rowcount = self._c.rowcount
         # Capture lastrowid if RETURNING clause present
         if 'returning' in sql.lower():
