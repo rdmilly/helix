@@ -196,6 +196,7 @@ services:
     - forge-data:/app/data
     - forge-workspace:/workspace
     - /opt/projects:/projects:rw
+    - /opt/projects/the-forge/services/scanner.py:/app/services/scanner.py:ro
     networks:
     - apps
     - mcp
