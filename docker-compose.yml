@@ -8,12 +8,6 @@ services:
     volumes:
       - /opt/data/helix:/app/data
       - /opt/projects:/opt/projects
-      # source mounts restored 2026-07-21: without these the image code is baked
-      # in and host edits silently do nothing (cost: a day of phantom patching)
-      - ./services:/app/services
-      - ./routers:/app/routers
-      - ./main.py:/app/main.py
-      - ./config.py:/app/config.py
     env_file:
       - .env
       - ./secrets/helix.env
