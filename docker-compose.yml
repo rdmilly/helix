@@ -15,6 +15,7 @@ services:
       - ./services/pg_sync.py:/app/services/pg_sync.py:ro
       - ./services/reconciler.py:/app/services/reconciler.py:ro
       - ./services/haiku.py:/app/services/haiku.py:ro
+      - ./services/exchange.py:/app/services/exchange.py:ro
     env_file:
       - .env
       - ./secrets/helix.env
