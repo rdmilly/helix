@@ -258,15 +258,28 @@ def _extract_intelligence(
     # 6. Create relationships
     relationships = data.get("relationships_found", [])
     rels_created = 0
+    rels_rejected = []
     for rel in relationships:
         if isinstance(rel, dict) and rel.get("source") and rel.get("target"):
             conn.execute(
                 "INSERT INTO kg_relationships (source_name, target_name, relation_type, description, session_id, created_at) VALUES (?,?,?,?,?,?)",
-                (rel["source"], rel["target"], rel.get("type", "related_to"), rel.get("description", ""), session_id, timestamp)
+                (rel["source"], rel["target"], rel.get("relation_type") or rel.get("type", "related_to"), rel.get("description", ""), session_id, timestamp)
             )
             rels_created += 1
+        else:
+            # Gate: never drop input silently (scar_helix_exchange_post_d07e).
+            if isinstance(rel, dict):
+                reason = "missing source and/or target"
+                sample = {k: rel.get(k) for k in ("source", "target", "relation_type", "type")}
+            else:
+                reason = "expected dict with source/target, got %s" % type(rel).__name__
+                sample = str(rel)[:120]
+            rels_rejected.append({"reason": reason, "input": sample})
     if relationships:
+        results["relationships_submitted"] = len(relationships)
         results["relationships_created"] = rels_created
+        if rels_rejected:
+            results["relationships_rejected"] = rels_rejected
 
     return results
 
