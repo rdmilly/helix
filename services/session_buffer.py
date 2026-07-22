@@ -173,6 +173,46 @@ def _mark(ids: List[str], status_value: str, detail: str = "") -> None:
             [(status_value, detail, _now(), i) for i in ids])
 
 
+def _flush_atoms(atoms: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Route authored atoms through the AST scanner into the atom catalog.
+
+    The scanner is Python-only and skips functions under 3 lines. Anything it
+    cannot take is reported with a reason, never silently discarded.
+    """
+    result: Dict[str, Any] = {"submitted": len(atoms), "created": 0, "skipped": []}
+    try:
+        import asyncio
+        from services.scanner import ScannerService
+    except Exception as exc:
+        result["skipped"].append({"reason": "scanner unavailable: %s" % exc})
+        return result
+
+    scanner = ScannerService()
+    for atom in atoms:
+        name = atom.get("name") or "<authored>"
+        lang = (atom.get("language") or "python").lower()
+        if lang != "python":
+            result["skipped"].append({
+                "name": name,
+                "reason": "scanner supports python only; %r cannot be extracted yet" % lang,
+            })
+            continue
+        try:
+            created = asyncio.run(scanner.extract_atoms(
+                atom["content"], lang, atom.get("file_path") or name))
+        except Exception as exc:
+            result["skipped"].append({"name": name, "reason": "extract failed: %s" % exc})
+            continue
+        if created:
+            result["created"] += len(created)
+        else:
+            result["skipped"].append({
+                "name": name,
+                "reason": "no atoms extracted (no top-level functions, or all under 3 lines)",
+            })
+    return result
+
+
 def flush(session_id: str, dry_run: bool = False) -> Dict[str, Any]:
     """Route buffered items into the durable intelligence layer.
 
@@ -201,12 +241,6 @@ def flush(session_id: str, dry_run: bool = False) -> Dict[str, Any]:
     }
 
     held = grouped.get("atom", [])
-    if held:
-        report["atoms_held"] = {
-            "count": len(held),
-            "reason": "authored-atom catalog path not wired yet; helix_scan requires Haiku."
-                      " Held in buffer as pending_catalog — not dropped.",
-        }
 
     if dry_run:
         report["would_route"] = sorted(t for t in grouped if t in _EXCHANGE_ROUTED)
@@ -250,5 +284,13 @@ def flush(session_id: str, dry_run: bool = False) -> Dict[str, Any]:
         report["error"] = str(exc)
 
     if held:
-        _mark(ids_by_type.get("atom", []), "pending_catalog", "awaiting authored-atom path")
+        atom_report = _flush_atoms(held)
+        report["atoms"] = atom_report
+        atom_ids = ids_by_type.get("atom", [])
+        if atom_report["created"] and not atom_report["skipped"]:
+            _mark(atom_ids, "flushed", "extracted via scanner")
+        elif atom_report["created"]:
+            _mark(atom_ids, "flushed", "partially extracted; see skipped")
+        else:
+            _mark(atom_ids, "pending_catalog", "no atoms extracted; see skipped")
     return report
