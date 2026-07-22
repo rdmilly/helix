@@ -152,7 +152,17 @@ class PgConn:
 
     def execute(self, sql: str, params=None) -> PgCursor:
         cur = self.cursor()
-        cur.execute(sql, params)
+        try:
+            cur.execute(sql, params)
+        except Exception:
+            # Roll back so one failed statement cannot abort the whole shared
+            # connection and cascade into InFailedSqlTransaction for every
+            # subsequent write (2026-07-21).
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            raise
         return cur
 
     def commit(self):

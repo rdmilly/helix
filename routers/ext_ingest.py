@@ -537,7 +537,12 @@ async def _summarize_conversations(
                     "provider": platform,
                     "intelligence_items": len(intelligence_items),
                     "tag_types": list(by_tag.keys()),
-                    "messages": conv_turns[:50],  # cap to avoid payload bloat
+                    "messages": [
+                        (t.model_dump() if hasattr(t, "model_dump")
+                         else t.dict() if hasattr(t, "dict")
+                         else t)
+                        for t in conv_turns[:50]
+                    ],  # cap to avoid payload bloat; plain dicts keep the queue payload JSON-safe
                 })
             except Exception as _be:
                 logger.debug(f"[ext_ingest] session.ingested publish failed (non-fatal): {_be}")
