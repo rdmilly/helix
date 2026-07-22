@@ -173,42 +173,55 @@ def _mark(ids: List[str], status_value: str, detail: str = "") -> None:
             [(status_value, detail, _now(), i) for i in ids])
 
 
+FORGE_URL = os.environ.get("FORGE_URL", "http://the-forge:9095")
+
+
 def _flush_atoms(atoms: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Route authored atoms through the AST scanner into the atom catalog.
+    """Route authored atoms to The Forge, the language-agnostic atom extractor.
 
-    The scanner is Python-only and skips functions under 3 lines. Anything it
-    cannot take is reported with a reason, never silently discarded.
+    Forge handles python, javascript, typescript, go, rust, ruby, bash, yaml,
+    json, toml, markdown and dockerfile. It is NOT the AST scanner in
+    services/scanner.py — that one is python-only and is the legacy local path.
+    Anything Forge refuses is reported with a reason, never silently discarded.
     """
-    result: Dict[str, Any] = {"submitted": len(atoms), "created": 0, "skipped": []}
-    try:
-        import asyncio
-        from services.scanner import ScannerService
-    except Exception as exc:
-        result["skipped"].append({"reason": "scanner unavailable: %s" % exc})
-        return result
+    import json as _json
+    import urllib.request
 
-    scanner = ScannerService()
+    result: Dict[str, Any] = {
+        "submitted": len(atoms), "extracted": 0, "new": 0, "updated": 0,
+        "skipped": [], "via": FORGE_URL,
+    }
     for atom in atoms:
         name = atom.get("name") or "<authored>"
-        lang = (atom.get("language") or "python").lower()
-        if lang != "python":
-            result["skipped"].append({
-                "name": name,
-                "reason": "scanner supports python only; %r cannot be extracted yet" % lang,
-            })
+        content = atom.get("content")
+        if not content:
+            result["skipped"].append({"name": name, "reason": "empty content"})
             continue
+        body = _json.dumps({
+            "file_path": atom.get("file_path") or name,
+            "content": content,
+            "language": (atom.get("language") or "python").lower(),
+            "project": atom.get("project") or "",
+            "source": "authored",
+        }).encode()
+        req = urllib.request.Request(
+            FORGE_URL + "/api/forge/scan", data=body,
+            headers={"Content-Type": "application/json"})
         try:
-            created = asyncio.run(scanner.extract_atoms(
-                atom["content"], lang, atom.get("file_path") or name))
+            resp = _json.loads(urllib.request.urlopen(req, timeout=30).read())
         except Exception as exc:
-            result["skipped"].append({"name": name, "reason": "extract failed: %s" % exc})
+            result["skipped"].append({"name": name, "reason": "forge error: %s" % exc})
             continue
-        if created:
-            result["created"] += len(created)
+        extracted = resp.get("atoms_extracted", 0)
+        if extracted:
+            result["extracted"] += extracted
+            result["new"] += resp.get("new_atoms", 0)
+            result["updated"] += resp.get("updated_atoms", 0)
         else:
             result["skipped"].append({
                 "name": name,
-                "reason": "no atoms extracted (no top-level functions, or all under 3 lines)",
+                "reason": "forge extracted 0 atoms (status=%s, language=%s)" % (
+                    resp.get("status"), resp.get("language")),
             })
     return result
 
@@ -287,9 +300,9 @@ def flush(session_id: str, dry_run: bool = False) -> Dict[str, Any]:
         atom_report = _flush_atoms(held)
         report["atoms"] = atom_report
         atom_ids = ids_by_type.get("atom", [])
-        if atom_report["created"] and not atom_report["skipped"]:
-            _mark(atom_ids, "flushed", "extracted via scanner")
-        elif atom_report["created"]:
+        if atom_report["extracted"] and not atom_report["skipped"]:
+            _mark(atom_ids, "flushed", "extracted via forge")
+        elif atom_report["extracted"]:
             _mark(atom_ids, "flushed", "partially extracted; see skipped")
         else:
             _mark(atom_ids, "pending_catalog", "no atoms extracted; see skipped")
