@@ -82,6 +82,12 @@ class HaikuService:
         return self._client
     
     async def _call_api(self, system: str, user_message: str, max_tokens: int = 1024) -> Optional[str]:
+        # GLOBAL LLM gate (2026-07-22). HELIX_LLM_ENRICH=0 stops ALL Haiku spend,
+        # not just the ingest path — the hourly haiku_reconciler burned ~$2.67 in
+        # 12h once its crash bug was fixed. Callers already handle None.
+        import os as _os
+        if _os.getenv("HELIX_LLM_ENRICH", "1").lower() not in ("1", "true", "yes", "on"):
+            return None
         """Make a single API call via LLMPort (provider-agnostic)."""
         if not self.circuit_breaker.can_execute():
             logger.warning("Haiku circuit breaker open, skipping API call")
