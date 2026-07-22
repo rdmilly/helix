@@ -16,6 +16,11 @@ services:
       - ./config.py:/app/config.py
     env_file:
       - .env
+      - ./secrets/helix.env
+    environment:
+      # embeddings moved to the controller card on VPS2; the old helix-embeddings
+      # container no longer exists and .env still points at it (2026-07-21)
+      EMBEDDINGS_URL: http://100.64.0.1:9060
     networks:
       - apps
       - data
