@@ -16,6 +16,9 @@ services:
       - ./services/reconciler.py:/app/services/reconciler.py:ro
       - ./services/haiku.py:/app/services/haiku.py:ro
       - ./services/exchange.py:/app/services/exchange.py:ro
+      - ./services/session_buffer.py:/app/services/session_buffer.py:ro
+      - ./routers/session_buffer.py:/app/routers/session_buffer.py:ro
+      - ./main.py:/app/main.py:ro
     env_file:
       - .env
       - ./secrets/helix.env

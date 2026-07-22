@@ -39,6 +39,7 @@ from routers.kb import router as kb_router
 from routers.backup import router as backup_router
 from routers.exchange import router as exchange_router
 from routers.ext_ingest import router as ext_ingest_router
+from routers.session_buffer import router as session_buffer_router
 from routers.membrain_vector import router as membrain_vector_router
 from routers.proxy import proxy_router
 from routers.ops import router as ops_router
@@ -386,6 +387,7 @@ app.include_router(runbook_router, tags=["Runbook - Dynamic Registry"])
 app.include_router(exchange_router, tags=["Exchange - Per-Exchange Observations"])
 app.include_router(ext_ingest_router, tags=["Extension Ingest"])
 app.include_router(membrain_vector_router, tags=["MemBrain Vector"])
+app.include_router(session_buffer_router, tags=["Session Buffer - Authored Intelligence"])
 app.include_router(shard_router, tags=["Shard - Diff Context"])
 app.include_router(turn_flush_router, tags=["Turn Flush - Phase 1.3"])
 app.include_router(proxy_router, tags=["Double Helix - Phase 7a: Conversation RAG"])
