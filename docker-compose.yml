@@ -1,4 +1,35 @@
 services:
+  helix-cortex:
+    build: .
+    container_name: helix-cortex
+    restart: unless-stopped
+    ports:
+      - "9050:9050"
+    volumes:
+      - /opt/data/helix:/app/data
+      - /opt/projects:/opt/projects
+      # source mounts restored 2026-07-21: without these the image code is baked
+      # in and host edits silently do nothing (cost: a day of phantom patching)
+      - ./services:/app/services
+      - ./routers:/app/routers
+      - ./main.py:/app/main.py
+      - ./config.py:/app/config.py
+    env_file:
+      - .env
+    networks:
+      - apps
+      - data
+      - mcp
+    depends_on:
+      helix-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9050/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
   helix-infisical-agent:
     image: infisical/cli:latest
     container_name: helix-infisical-agent
