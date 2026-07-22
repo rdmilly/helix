@@ -232,7 +232,22 @@ async def _summarize_conversations(
 ) -> None:
     """Background task: Haiku summarizes + extracts 9-tag intelligence for each conversation."""
     import sqlite3
+    import os
     import uuid as uuid_mod
+
+    # LLM enrichment gate (2026-07-21). Haiku runs ~9 calls per conversation at
+    # ~$0.067 each; a 2108-conversation backfill would cost ~$141 on OpenRouter.
+    # With HELIX_LLM_ENRICH=0 the raw path still runs in full — storage, chunking,
+    # embeddings (via the controller card), FTS — so recall works immediately and
+    # summaries/intelligence are produced later by the Claude-authored pipeline.
+    if os.getenv("HELIX_LLM_ENRICH", "1").lower() not in ("1", "true", "yes", "on"):
+        logger.info(
+            "[ext_ingest] LLM enrichment DISABLED (HELIX_LLM_ENRICH=0) — "
+            "%d conversation(s) stored raw, pending summarization",
+            len(grouped),
+        )
+        return
+
     haiku = _get_haiku()
 
     for conv_id, conv_turns in grouped.items():
